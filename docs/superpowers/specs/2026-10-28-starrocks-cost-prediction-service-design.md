@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-28  
 **Status:** Reviewed & Approved (Principal Engineer / SRE Hardened)  
-**Language / Runtime:** Rust (Edition 2021, Single Static Binary)
+**Language / Runtime:** Rust (Edition 2024, `rustc >= 1.85`, Single Static Binary)
 
 ---
 
@@ -233,7 +233,7 @@ Captures recurring query templates:
 ### 5.2 Tier 2: Multi-Target Pure-Rust GBDT Ensemble (`~15µs` Latency)
 Generalizes across unseen query plans and multi-table interactions:
 * **Engine:** Self-contained Pure-Rust Histogram/Exact Gradient Boosted Decision Tree regressor (`src/model/gbdt.rs`) with flat cache-aligned contiguous `Vec<TreeNode>` arrays and zero C++/FFI dependencies, supporting both **Huber loss (P50)** and **Pinball / Quantile loss ($\alpha = 0.90$ for P90)**!
-  *(Why an idiomatic native Rust GBDT implementation in `src/model/gbdt.rs`? External crates either pull in C++ compilers or lack native quantile pinball loss + zero-copy `serde` serialization. A clean 250-line exact/binned CART boosted tree learner with Pinball & Huber gradients in pure Rust compiles in 1 second, serializes directly via `bincode`, and runs 100 trees of depth 5 in `< 3µs`!)*
+  *(Why an idiomatic native Rust GBDT implementation in `src/model/gbdt.rs`? External crates either pull in C++ compilers or lack native quantile pinball loss + zero-copy `serde` serialization. A clean 250-line exact/binned CART boosted tree learner with Pinball & Huber gradients in pure Rust compiles in 1 second, serializes directly via `rmp-serde` (MessagePack), and runs 100 trees of depth 5 in `< 3µs`!)*
 * **Trained Ensembles in `GbdtModelSet`:**
   1. `mem_p90`: Pinball loss ($\alpha = 0.90$) on $\ln(1 + \text{effective\_mem\_bytes})$.
   2. `mem_p50`: Huber loss ($\delta = 1.0$) on $\ln(1 + \text{effective\_mem\_bytes})$.

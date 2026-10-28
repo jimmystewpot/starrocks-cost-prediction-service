@@ -2,17 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a self-learning, sub-millisecond Rust cost prediction service for StarRocks (`POST /predict_csv`, `GET /health_check`, `POST /v1/predict`, and multi-source async telemetry ingestion) backed by a 3-Tier ML Ensemble (Plan-Signature EWMA Sketch + Pure-Rust Multi-Target GBDT + Online RLS CBO Calibrator) and embedded SQLite WAL storage.
+**Goal:** Build a self-learning, sub-millisecond Rust cost prediction service for StarRocks (`POST /predict_csv`, `GET /health_check`, `POST /v1/predict`, and multi-source async telemetry ingestion) backed by a 3-Tier ML Ensemble (Plan-Signature EWMA Sketch + Pure-Rust Multi-Target GBDT + Online RLS CBO Calibrator), embedded SQLite WAL storage, CI/CD workflows, Dependabot automation, and comprehensive root documentation (`README.md` and `AGENTS.md`).
 
-**Architecture:** The service separates the synchronous CPU-bound inference plane (`axum` + `ArcSwap` + `DashMap`, `p99 < 250µs`, `TCP_NODELAY`) from the asynchronous ingestion and background training plane (`rayon` + `rusqlite` bundled WAL). Incoming StarRocks CSV and `fe.features.log` payloads are decoded by a version-resilient self-synchronizing segment parser into a 39-dimensional dense feature vector (`DenseFeatureVector`). Predictions blend Tier 1 (Plan-Signature EWMA Sketch), Tier 2 (Pure-Rust GBDT ensemble predicting `mem_p90`, `mem_p50`, `scan_bytes`, `return_rows`, `cpu_ns`, and `spill_prob`), and Tier 3 (Online RLS CBO Calibrator) with safety clamping and 10-bit watermark correlation for audit logs.
+**Architecture:** The service separates the synchronous CPU-bound inference plane (`axum` 0.8 + `ArcSwap` 1.9 + `DashMap` 6.2, `p99 < 250µs`, `TCP_NODELAY`) from the asynchronous ingestion and background training plane (`rayon` 1.12 + `rusqlite` 0.41 bundled WAL). Incoming StarRocks CSV and `fe.features.log` payloads are decoded by a version-resilient self-synchronizing segment parser into a 39-dimensional dense feature vector (`DenseFeatureVector`). Predictions blend Tier 1 (Plan-Signature EWMA Sketch), Tier 2 (Pure-Rust GBDT ensemble predicting `mem_p90`, `mem_p50`, `scan_bytes`, `return_rows`, `cpu_ns`, and `spill_prob`), and Tier 3 (Online RLS CBO Calibrator) with safety clamping and 10-bit watermark correlation for audit logs.
 
-**Tech Stack:** Rust (Edition 2021), `axum` 0.7, `tokio` 1.x, `arc-swap` 1.7, `dashmap` 6.x, `xxhash-rust` (with `xxh3`), `rusqlite` (with `bundled`), `rayon`, `serde` / `serde_json` / `bincode`, `thiserror`, `tracing`.
+**Tech Stack:** Rust (Edition 2024, `rustc 1.99+`), `axum = "0.8.9"`, `tokio = "1.54.1"`, `arc-swap = "1.9.3"`, `dashmap = "6.2.1"`, `xxhash-rust = "0.8.19"` (`xxh3`), `rusqlite = "0.41.0"` (`bundled`), `rayon = "1.12.0"`, `serde = "1.0.229"`, `serde_json = "1.0.154"`, `rmp-serde = "1.3.1"`, `thiserror = "2.0.21"`, `tracing = "0.1.44"`, `tracing-subscriber = "0.3.23"`, `tower = "0.5.3"`, `http-body-util = "0.1.5"`, `tempfile = "3.27.0"`. GitHub Actions (`actions/checkout@v7`, `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`) & Dependabot v2 (`cargo` + `github-actions`).
 
 **Spec:** `docs/superpowers/specs/2026-10-28-starrocks-cost-prediction-service-design.md`
 
 ## Global Constraints
 
-- **Rust Edition & Zero C++ ML Dependencies:** Rust Edition 2021; must compile cleanly with `cargo test` using pure-Rust GBDT (`src/model/gbdt.rs`) and `rusqlite` (`bundled`) with zero external Python/C++ runtime requirements.
+- **Rust Edition & Latest Stable Crates:** Rust `edition = "2024"` in `Cargo.toml` with latest stable versions of all dependencies (`axum 0.8.9`, `tokio 1.54.1`, `arc-swap 1.9.3`, `dashmap 6.2.1`, `xxhash-rust 0.8.19`, `rusqlite 0.41.0`, `rayon 1.12.0`, `serde 1.0.229`, `serde_json 1.0.154`, `rmp-serde 1.3.1`, `thiserror 2.0.21`, `tracing 0.1.44`, `tracing-subscriber 0.3.23`, `tower 0.5.3`, `http-body-util 0.1.5`, `tempfile 3.27.0`).
+- **Formatting, Linting & CI Gate:** All code must pass `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets`.
 - **Zero-HTTP-500 Policy on `/predict_csv`:** `POST /predict_csv` must always return HTTP `200 OK` with a parseable numeric string (falling back to `config.fallback_mem_bytes` on malformed CSV) so StarRocks FE logs are never flooded with stack traces.
 - **Dense Feature Dimensionality:** `DENSE_FEATURE_DIM = 39` (`24` synthesized plan/operator/environment features + `3 * 5 = 15` target-encoded table telemetry features).
 - **Safety Clamping & Integer Truncation Compensation:** `env_2` is `(long) Math.log1p(memCapacityOfBE)`, so per-BE memory capacity upper bound is `exp((env_2 + 1).min(40) as f64)`. Final predicted memory bytes are clamped to `[config.min_predicted_mem_bytes (default 1_048_576), max_cluster_mem_bytes]`.
@@ -33,21 +34,22 @@
 Tasks are structured into **4 Waves** to maximize parallel subagent execution after Task 1 initializes the workspace and shared types:
 
 - **Wave 1 (Foundation — Sequential):**
-  - **Task 1:** Cargo Workspace, Config, Core Domain Types & Shared Interfaces (`src/config.rs`, `src/types.rs`, `src/lib.rs`)
-- **Wave 2 (Core Subsystems — 4 Parallel Subagents in Isolated Worktrees/Branches):**
+  - **Task 1:** Cargo Workspace (Edition 2024, Latest Crates), Config, Core Domain Types & Shared Interfaces (`Cargo.toml`, `src/config.rs`, `src/types.rs`, `src/lib.rs`)
+- **Wave 2 (Core Subsystems — 5 Parallel Subagents in Isolated Worktrees/Branches):**
   - **Task 2 (Subagent A):** StarRocks Feature Decoder, Self-Synchronizing Segment Walker & Table Telemetry Catalog (`src/features/`)
   - **Task 3 (Subagent B):** Tier 1 Plan-Signature Sketch & Tier 3 Online RLS CBO Calibrator (`src/model/sketch.rs`, `src/model/rls.rs`)
   - **Task 4 (Subagent C):** Tier 2 Pure-Rust GBDT Learner (Pinball P90 & Huber P50) (`src/model/gbdt.rs`)
   - **Task 5 (Subagent D):** Multi-Source Telemetry Parsers (`fe.features.log`, Audit JSON, Query Profile) & SQLite WAL Store (`src/ingest/parser.rs`, `src/storage/sqlite.rs`)
+  - **Task 6 (Subagent E):** CI/CD GitHub Actions (Tests, `clippy`, `rustfmt`), Dependabot Configuration (`cargo` & `github-actions`), `README.md` & `AGENTS.md` (`.github/workflows/ci.yml`, `.github/dependabot.yml`, `README.md`, `AGENTS.md`)
 - **Wave 3 (Ensemble & Orchestration — 2 Parallel Subagents):**
-  - **Task 6 (Subagent E):** 3-Tier Ensemble Blender, `ArcSwap` Snapshot Manager, Drift Detector & Background Trainer (`src/model/ensemble.rs`, `src/trainer/mod.rs`)
-  - **Task 7 (Subagent F):** In-Flight Prediction Correlator & Resilient File Tailer (`src/ingest/correlator.rs`, `src/ingest/tailer.rs`)
+  - **Task 7 (Subagent F):** 3-Tier Ensemble Blender, `ArcSwap` Snapshot Manager, Drift Detector & Background Trainer (`src/model/ensemble.rs`, `src/trainer/mod.rs`)
+  - **Task 8 (Subagent G):** In-Flight Prediction Correlator & Resilient File Tailer (`src/ingest/correlator.rs`, `src/ingest/tailer.rs`)
 - **Wave 4 (API Server & End-to-End Verification — Sequential):**
-  - **Task 8:** Axum HTTP Server (`/predict_csv`, `/health_check`, `/v1/predict`, `/v1/ingest/*`, `/v1/admin/*`, `/metrics`), CLI Entrypoint & End-to-End Convergence Test (`src/api/mod.rs`, `src/main.rs`, `tests/e2e_convergence.rs`)
+  - **Task 9:** Axum 0.8 HTTP Server (`/predict_csv`, `/health_check`, `/v1/predict`, `/v1/ingest/*`, `/v1/admin/*`, `/metrics`), CLI Entrypoint, Full Verification (`fmt`, `clippy`, `test`) & End-to-End Convergence Suite (`src/api/mod.rs`, `src/main.rs`, `tests/e2e_convergence.rs`)
 
 ---
 
-### Task 1: Project Foundation, Config & Shared Domain Types
+### Task 1: Project Foundation, Latest Crates, Config & Shared Domain Types
 
 **Files:**
 - Create: `Cargo.toml`
@@ -61,7 +63,7 @@ Tasks are structured into **4 Waves** to maximize parallel subagent execution af
 - Produces:
   - `crate::config::AppConfig` (`bind_addr: String`, `db_path: PathBuf`, `features_log_path: Option<PathBuf>`, `min_predicted_mem_bytes: u64`, `fallback_mem_bytes: u64`, `max_cluster_mem_multiplier: f64`, `max_sketch_entries: usize`, `min_new_samples_for_retrain: usize`, `retrain_interval_secs: u64`, `drift_q_error_threshold: f64`)
   - `crate::types::DENSE_FEATURE_DIM: usize = 39`
-  - `crate::types::DenseFeatureVector = [f64; 39]`
+  - `crate::types::DenseFeatureVector = Vec<f64>` (or `[f64; 39]` with serde array support — use `[f64; 39]` with `serde_big_array` or `Vec<f64>` / struct wrapper; Note: in `serde 1.0`, `[T; 39]` exceeds the built-in array trait impl limit of 32 unless serialized as slice/vec or `#[derive(Serialize, Deserialize)]` struct `DenseFeatures(pub [f64; 39])` with custom `Serialize`/`Deserialize` or `pub type DenseFeatureVector = [f64; 39]` serialized via `.as_slice()` in SQLite/MessagePack!)
   - `crate::types::OperatorSegmentKind` (`Scan`, `HashJoin`, `HashAgg`, `Exchange`, `Generic`)
   - `crate::types::OperatorSegment` (`ordinal: i64`, `kind: OperatorSegmentKind`, `count: u64`, `mean_log_rows: f64`, `mean_row_size: f64`, `mean_log_cbo_mem: f64`, `mean_log_cbo_cpu: f64`, `mean_log_limit: f64`, `extra: Vec<i64>`)
   - `crate::types::CanonicalPlanFeatures` (`tables: [String; 3]`, `num_be_nodes: u64`, `avg_cpu_cores: u64`, `env_mem_log: u64`, `pipeline_dop: u64`, `segments: Vec<OperatorSegment>`, `plan_hash: u64`, `plan_features_24: [f64; 24]`)
@@ -70,11 +72,42 @@ Tasks are structured into **4 Waves** to maximize parallel subagent execution af
   - `crate::types::watermark_mem_bytes(raw_bytes: u64, plan_hash: u64, min_bytes: u64) -> u64`
   - `crate::types::compute_effective_mem_bytes(mem_cost_bytes: u64, spilled_bytes: u64, state: &str) -> Option<u64>`
   - `crate::types::compute_cluster_max_mem_bytes(num_be_nodes: u64, env_mem_log: u64, multiplier: f64) -> u64`
+  - `crate::types::memory_stratum(bytes: u64) -> u8`
 
-- [ ] **Step 1: Create `Cargo.toml` and stub modules with failing unit tests in `src/types.rs`**
+- [ ] **Step 1: Create `Cargo.toml` with latest stable dependencies and stub modules with failing unit tests in `src/types.rs`**
 
-Write `Cargo.toml` with dependencies (`tokio`, `axum`, `serde`, `serde_json`, `bincode`, `arc-swap`, `dashmap`, `xxhash-rust` with `xxh3`, `rusqlite` with `bundled`, `rayon`, `thiserror`, `tracing`, `tracing-subscriber`, `tower`, `http-body-util`, `tempfile`) and add unit tests in `src/types.rs`:
+Write `Cargo.toml`:
+```toml
+[package]
+name = "starrocks-cost-prediction-service"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "High-performance ML query cost prediction service for StarRocks CBO and Query Queue V2"
+license = "Apache-2.0"
 
+[dependencies]
+axum = "0.8.9"
+tokio = { version = "1.54.1", features = ["full"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+rmp-serde = "1.3.1"
+arc-swap = "1.9.3"
+dashmap = "6.2.1"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+rayon = "1.12.0"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1.5"
+tempfile = "3.27.0"
+```
+
+And add unit tests in `src/types.rs`:
 ```rust
 #[cfg(test)]
 mod tests {
@@ -122,18 +155,18 @@ Expected: FAIL (functions not implemented)
 
 - [ ] **Step 3: Implement `src/config.rs`, `src/types.rs`, `src/lib.rs`, and `src/main.rs`**
 
-Implement `AppConfig::default()`, `watermark_mem_bytes`, `compute_effective_mem_bytes`, `compute_cluster_max_mem_bytes`, `memory_stratum(bytes: u64) -> u8` (`0` for `<10MB`, `1` for `<100MB`, `2` for `<1GB`, `3` for `<10GB`, `4` for `>=10GB`), and the shared structs with `#[derive(Clone, Debug, Serialize, Deserialize)]`.
+Implement `AppConfig::default()`, `watermark_mem_bytes`, `compute_effective_mem_bytes`, `compute_cluster_max_mem_bytes`, `memory_stratum(bytes: u64) -> u8` (`0` for `<10MB`, `1` for `<100MB`, `2` for `<1GB`, `3` for `<10GB`, `4` for `>=10GB`), and the shared structs.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 4: Run test and clippy to verify it passes cleanly**
 
-Run: `cargo test --lib types::tests`
-Expected: PASS (3 tests passing)
+Run: `cargo test --lib types::tests && cargo clippy --all-targets -- -D warnings`
+Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock src/
-git commit -m "feat: initialize Rust crate, config, and core domain types"
+git commit -m "feat: initialize Rust 2024 crate with latest dependencies and core domain types"
 ```
 
 ---
@@ -149,13 +182,18 @@ git commit -m "feat: initialize Rust crate, config, and core domain types"
 **Interfaces:**
 - Consumes: `crate::types::{CanonicalPlanFeatures, DenseFeatureVector, OperatorSegment, OperatorSegmentKind, DENSE_FEATURE_DIM}`
 - Produces:
+  - `crate::features::decoder::DecodeError` (`#[derive(Debug, thiserror::Error)]`)
   - `crate::features::decoder::parse_predict_csv(csv_body: &str) -> Result<CanonicalPlanFeatures, DecodeError>`
   - `crate::features::decoder::parse_feature_string(feature_str: &str) -> Result<CanonicalPlanFeatures, DecodeError>` (parses `tables=[...]|env=[...]|var=[...]|operators=[...]`)
   - `crate::features::decoder::decode_operator_segments(ops: &[i64]) -> Result<Vec<OperatorSegment>, DecodeError>`
+  - `crate::features::catalog::TableProfile` (`#[derive(Clone, Debug, Serialize, Deserialize)]`)
   - `crate::features::catalog::TableCatalog` with:
     - `TableCatalog::new() -> Self`
     - `TableCatalog::record_execution(&self, tables: &[String; 3], scan_bytes: u64, scan_rows: u64, actual_mem_bytes: u64, cbo_mem_log: f64, spilled: bool)`
     - `TableCatalog::build_dense_features(&self, plan: &CanonicalPlanFeatures) -> (DenseFeatureVector, f64)` (returns the 39-element vector and `known_table_ratio` in `0.0..=1.0`)
+    - `TableCatalog::len(&self) -> usize`
+    - `TableCatalog::export_profiles(&self) -> Vec<(String, TableProfile)>`
+    - `TableCatalog::import_profiles(&self, profiles: Vec<(String, TableProfile)>)`
 
 - [ ] **Step 1: Write failing tests for segment decoding, summed-log correction, CSV/pipe parsing, and `TableCatalog` in `src/features/decoder.rs` and `src/features/catalog.rs`**
 
@@ -166,12 +204,6 @@ mod tests {
 
     #[test]
     fn test_self_synchronizing_segment_walker_handles_starrocks_operators() {
-        // Simulated sequence of operator segments:
-        // Op 34 (Exchange, len 8): [34, 1, 10, 100, 14, 12, 0, 2]
-        // Op 35 (HashAgg, len 11): [35, 2, 20, 64, 28, 24, 0, 24, 4, 2, 10]
-        // Op 36 (HashJoin, len 10): [36, 2, 22, 128, 32, 30, 0, 20, 2, 1]
-        // Op 38 (NestLoopJoin, skipped 37 MergeJoin, len 7): [38, 0, 0, 0, 0, 0, 0]
-        // Op 39 (OlapScan, len 11): [39, 1, 15, 100, 18, 16, 0, 12, 3, 2, 2]
         let ops: Vec<i64> = vec![
             34, 1, 10, 100, 14, 12, 0, 2,
             35, 2, 20, 64, 28, 24, 0, 24, 4, 2, 10,
@@ -183,7 +215,6 @@ mod tests {
         assert_eq!(segments.len(), 5);
         assert_eq!(segments[0].kind, OperatorSegmentKind::Exchange);
         assert_eq!(segments[1].kind, OperatorSegmentKind::HashAgg);
-        // Summed log correction: count=2, raw summed log mem=28 -> mean_log_cbo_mem = 14.0
         assert!((segments[1].mean_log_cbo_mem - 14.0).abs() < 1e-6);
         assert_eq!(segments[2].kind, OperatorSegmentKind::HashJoin);
         assert_eq!(segments[3].kind, OperatorSegmentKind::Generic);
@@ -207,7 +238,7 @@ mod tests {
         let f_small = parse_feature_string(pipe_small).unwrap();
         let f_large = parse_feature_string(pipe_large).unwrap();
         assert_eq!(f_small.plan_hash, f_large.plan_hash);
-        assert!(f_large.plan_features_24[21] > f_small.plan_features_24[21]); // cbo_est_total_mem_log differs
+        assert!(f_large.plan_features_24[21] > f_small.plan_features_24[21]);
     }
 
     #[test]
@@ -223,7 +254,7 @@ mod tests {
         }
         let (dense, ratio_after) = catalog.build_dense_features(&plan);
         assert_eq!(dense.len(), DENSE_FEATURE_DIM);
-        assert!((ratio_after - 1.0).abs() < 1e-6); // both non-"0" tables (1001, 1002) have >= 5 executions
+        assert!((ratio_after - 1.0).abs() < 1e-6);
     }
 }
 ```
@@ -231,11 +262,11 @@ mod tests {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --lib features`
-Expected: FAIL (modules not implemented)
+Expected: FAIL
 
 - [ ] **Step 3: Implement `src/features/decoder.rs`, `src/features/catalog.rs`, and `src/features/mod.rs`**
 
-Use dynamic programming / backtracking over step sizes `[7, 8, 10, 11]` in `decode_operator_segments(ops: &[i64])`: a transition from `pos` to `pos + len` is valid if `pos + len == ops.len()` or `(ops[pos + len] - ops[pos])` is in `1..=3` (preferring step delta `1` or `2`). Compute the 24 plan features and `xxh3_64` structural `plan_hash` (hashing sorted non-zero tables + `(segment_idx, count, extra_structural_flags)`).
+Use dynamic programming / backtracking over step sizes `[7, 8, 10, 11]` in `decode_operator_segments(ops: &[i64])`: a transition from `pos` to `pos + len` is valid if `pos + len == ops.len()` or `(ops[pos + len] - ops[pos])` is in `1..=3` (preferring step delta `1` or `2`). Compute the 24 plan features and `xxh3_64` structural `plan_hash`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -262,8 +293,10 @@ git commit -m "feat(features): add self-synchronizing StarRocks segment decoder 
 **Interfaces:**
 - Consumes: `crate::types::CanonicalPlanFeatures`
 - Produces:
+  - `crate::model::sketch::PlanSketchEntry` (`#[derive(Clone, Debug, Serialize, Deserialize)]`)
   - `crate::model::sketch::PlanSketchCache` (`new(max_entries: usize) -> Self`, `predict(&self, plan: &CanonicalPlanFeatures) -> Option<SketchPrediction>`, `update(&self, plan: &CanonicalPlanFeatures, effective_mem_bytes: u64, scan_bytes: u64, return_rows: u64, cpu_cost_ns: u64, spilled: bool)`, `len(&self) -> usize`, `export_entries(&self) -> Vec<(u64, PlanSketchEntry)>`, `import_entries(&self, entries: Vec<(u64, PlanSketchEntry)>)`)
   - `crate::model::sketch::SketchPrediction` (`log_mem_p50: f64`, `log_mem_p90: f64`, `log_scan_bytes: f64`, `log_return_rows: f64`, `log_cpu_ns: f64`, `spill_prob: f64`, `confidence: f64`)
+  - `crate::model::rls::RlsState` (`#[derive(Clone, Debug, Serialize, Deserialize)]`)
   - `crate::model::rls::OnlineRlsCalibrator` (`new() -> Self`, `predict(&self, plan: &CanonicalPlanFeatures) -> RlsPrediction`, `update(&self, plan: &CanonicalPlanFeatures, effective_mem_bytes: u64, scan_bytes: u64, return_rows: u64, cpu_cost_ns: u64)`, `to_state(&self) -> RlsState`, `from_state(state: RlsState) -> Self`)
   - `crate::model::rls::RlsPrediction` (`log_mem_p50: f64`, `log_mem_p90: f64`, `log_scan_bytes: f64`, `log_return_rows: f64`, `log_cpu_ns: f64`)
 
@@ -292,7 +325,6 @@ mod tests {
         assert!(pred_base.log_mem_p90 > pred_base.log_mem_p50);
         assert!(pred_base.confidence > 0.60);
 
-        // Same plan template with higher estimated scan rows (18 vs 14) scales prediction upward
         let plan_larger = parse_feature_string(
             "tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[39,1,18,100,16,14,0,12,2,1,1]"
         ).unwrap();
@@ -309,7 +341,6 @@ mod tests {
         let cold = rls.predict(&plan);
         assert!(cold.log_mem_p50.is_finite());
 
-        // Feed 100 identical/collinear updates where CBO underpredicts by e^2 (~7.4x)
         let target_mem = ((plan.plan_features_24[21] + 2.0).exp() as u64).max(10_000_000);
         for _ in 0..100 {
             rls.update(&plan, target_mem, 50_000_000, 5_000, 100_000_000);
@@ -325,11 +356,11 @@ mod tests {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --lib model`
-Expected: FAIL (modules not implemented)
+Expected: FAIL
 
 - [ ] **Step 3: Implement `src/model/sketch.rs`, `src/model/rls.rs`, and `src/model/mod.rs`**
 
-Implement `PlanSketchCache` using `DashMap<u64, PlanSketchEntry>` with EWMA $\alpha = 0.20$ and confidence $c_1 = \min(0.95, \frac{n}{n+5} \exp(-0.20 \cdot \text{var}) \exp(-0.15 \cdot |\Delta r|))$. Implement `OnlineRlsCalibrator` with `parking_lot::RwLock` or `std::sync::RwLock` around the $6 \times 6$ covariance matrix $\mathbf{P}$, forgetting factor $\lambda = 0.995$, symmetry enforcement, and diagonal clamping $[10^{-6}, 10^4]$.
+Implement `PlanSketchCache` using `DashMap<u64, PlanSketchEntry>` with EWMA $\alpha = 0.20$ and confidence $c_1 = \min(0.95, \frac{n}{n+5} \exp(-0.20 \cdot \text{var}) \exp(-0.15 \cdot |\Delta r|))$. Implement `OnlineRlsCalibrator` with `std::sync::RwLock` around the $6 \times 6$ covariance matrix $\mathbf{P}$, forgetting factor $\lambda = 0.995$, symmetry enforcement, and diagonal clamping $[10^{-6}, 10^4]$.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -356,9 +387,9 @@ git commit -m "feat(model): implement Tier 1 PlanSketchCache and Tier 3 OnlineRl
 - Produces:
   - `crate::model::gbdt::LossType` (`Huber { delta: f64 }`, `Pinball { alpha: f64 }`)
   - `crate::model::gbdt::GbdtHyperparams` (`n_estimators: usize`, `max_depth: usize`, `learning_rate: f64`, `min_samples_leaf: usize`)
-  - `crate::model::gbdt::BoostedTreeRegressor` (`train(features: &[DenseFeatureVector], targets: &[f64], loss: LossType, params: &GbdtHyperparams) -> Self`, `predict(&self, x: &DenseFeatureVector) -> f64`)
+  - `crate::model::gbdt::BoostedTreeRegressor` (`#[derive(Clone, Debug, Serialize, Deserialize)]`, `train(features: &[DenseFeatureVector], targets: &[f64], loss: LossType, params: &GbdtHyperparams) -> Self`, `predict(&self, x: &DenseFeatureVector) -> f64`)
   - `crate::model::gbdt::GbdtTrainingRow` (`features: DenseFeatureVector`, `log_mem: f64`, `log_scan_bytes: f64`, `log_return_rows: f64`, `log_cpu_ns: f64`, `spilled: f64`)
-  - `crate::model::gbdt::GbdtModelSet` (`train_parallel(rows: &[GbdtTrainingRow], params: &GbdtHyperparams) -> Self`, `predict_mem_p90(&self, x: &DenseFeatureVector) -> f64`, `predict_all(&self, x: &DenseFeatureVector) -> GbdtPrediction`)
+  - `crate::model::gbdt::GbdtModelSet` (`#[derive(Clone, Debug, Serialize, Deserialize)]`, `train_parallel(rows: &[GbdtTrainingRow], params: &GbdtHyperparams) -> Self`, `predict_mem_p90(&self, x: &DenseFeatureVector) -> f64`, `predict_all(&self, x: &DenseFeatureVector) -> GbdtPrediction`)
   - `crate::model::gbdt::GbdtPrediction` (`log_mem_p90: f64`, `log_mem_p50: f64`, `log_scan_bytes: f64`, `log_return_rows: f64`, `log_cpu_ns: f64`, `spill_prob: f64`)
   - `crate::model::gbdt::pinball_loss(y_true: f64, y_pred: f64, alpha: f64) -> f64`
 
@@ -380,7 +411,6 @@ mod tests {
             let is_bcast_join = if i % 2 == 0 { 1.0 } else { 0.0 };
             x[3] = scans;
             x[11] = is_bcast_join;
-            // Base log memory + noise asymmetry
             let noise = ((i % 7) as f64 - 3.0) * 0.4;
             let y = 14.0 + 0.5 * scans + 2.5 * is_bcast_join + noise;
             features.push(x);
@@ -413,10 +443,7 @@ Expected: FAIL
 
 - [ ] **Step 3: Implement `src/model/gbdt.rs` with flat cache-aligned `TreeNode` arrays and `rayon` parallel multi-target training**
 
-Implement Histogram/Quantile-binned CART tree boosting over `DenseFeatureVector`:
-- For `LossType::Huber { delta }`: initial prediction is median of `targets`; negative gradient $g_i = r_i$ if $|r_i| \le \delta$ else $\delta \cdot \text{sign}(r_i)$ where $r_i = y_i - \hat{y}_i$.
-- For `LossType::Pinball { alpha }`: initial prediction is the $\alpha$-quantile of `targets`; negative gradient $g_i = \alpha$ if $y_i > \hat{y}_i$ else $-(1.0 - \alpha)$, and leaf values are updated with the $\alpha$-quantile (or damped gradient step) of residuals in the leaf.
-- `GbdtModelSet::train_parallel` uses `rayon::join` / `par_iter` to train the 6 target ensembles concurrently.
+Implement Histogram/Quantile-binned CART tree boosting over `DenseFeatureVector` with `LossType::Huber` and `LossType::Pinball` (computing the exact $\alpha$-quantile of residuals `y_i - F_{m-1}(x_i)` in each terminal leaf for Pinball loss so quantile trees converge rapidly and accurately).
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -442,12 +469,14 @@ git commit -m "feat(model): implement pure-Rust multi-target GBDT with Pinball P
 - Modify: `src/lib.rs`
 
 **Interfaces:**
-- Consumes: `crate::types::{TelemetrySample, DenseFeatureVector}`, `crate::features::decoder::parse_feature_string`
+- Consumes: `crate::types::{TelemetrySample, DenseFeatureVector}`, `crate::features::decoder::parse_feature_string`, `crate::model::gbdt::GbdtTrainingRow`
 - Produces:
+  - `crate::ingest::parser::ParseError` (`#[derive(Debug, thiserror::Error)]`)
   - `crate::ingest::parser::parse_features_log_line(line: &str) -> Result<Option<TelemetrySample>, ParseError>`
-  - `crate::ingest::parser::AuditLogEvent` (`digest: String`, `predict_mem_bytes: u64`, `mem_cost_bytes: u64`, `scan_bytes: u64`, `scan_rows: u64`, `return_rows: u64`, `cpu_cost_ns: u64`, `spilled_bytes: u64`, `query_time_ms: u64`, `state: String`, `tables: Vec<String>`)
+  - `crate::ingest::parser::AuditLogEvent` (`#[derive(Clone, Debug, Serialize, Deserialize)]` with `digest: String`, `predict_mem_bytes: u64`, `mem_cost_bytes: u64`, `scan_bytes: u64`, `scan_rows: u64`, `return_rows: u64`, `cpu_cost_ns: u64`, `spilled_bytes: u64`, `query_time_ms: u64`, `state: String`, `tables: Vec<String>`)
   - `crate::ingest::parser::ProfileSummary` (`tables: Vec<String>`, `peak_mem_bytes: u64`, `scan_bytes: u64`, `scan_rows: u64`, `spilled_bytes: u64`)
   - `crate::ingest::parser::parse_query_profile(payload: &str) -> Result<ProfileSummary, ParseError>`
+  - `crate::storage::sqlite::StorageError` (`#[derive(Debug, thiserror::Error)]`)
   - `crate::storage::sqlite::SqliteStore` (`open(path: &Path, max_per_stratum: usize) -> Result<Self, StorageError>`, `insert_sample(&self, plan_hash: u64, dense: &DenseFeatureVector, sample: &TelemetrySample) -> Result<(), StorageError>`, `load_training_rows(&self) -> Result<Vec<GbdtTrainingRow>, StorageError>`, `sample_counts_by_stratum(&self) -> Result<[usize; 5], StorageError>`, `save_snapshot_blob(&self, version: u64, metrics_json: &str, blob: &[u8]) -> Result<(), StorageError>`, `load_latest_snapshot_blob(&self) -> Result<Option<(u64, String, Vec<u8>)>, StorageError>`, `get_file_checkpoint(&self, path: &str) -> Result<Option<(u64, u64)>, StorageError>`, `set_file_checkpoint(&self, path: &str, inode: u64, offset: u64) -> Result<(), StorageError>`)
 
 - [ ] **Step 1: Write failing tests for log4j-prefixed `fe.features.log` parsing, profile parsing, and SQLite cost-stratified retention in `src/ingest/parser.rs` and `src/storage/sqlite.rs`**
@@ -462,9 +491,8 @@ mod tests {
         let line = "2026-10-28 21:00:01,112 INFO (qe|99) [AuditLogBuilder.java:185] digest=abc123|cpuCostNs=500000|memCostBytes=40000000|scanBytes=10000000|scanRows=50000|returnRows=100|spilledBytes=10000000|time=120|state=EOF|catalog=default_catalog|database=db1|tables=[0,0,1001]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]";
         let sample = parse_features_log_line(line).unwrap().expect("valid sample");
         assert_eq!(sample.digest, "abc123");
-        assert_eq!(sample.effective_mem_bytes, 50_000_000); // 40MB + 10MB spill
+        assert_eq!(sample.effective_mem_bytes, 50_000_000);
 
-        // Syntax error line with state=ERR and memCostBytes=0 returns Ok(None)
         let err_line = "digest=def|cpuCostNs=0|memCostBytes=0|scanBytes=0|scanRows=0|returnRows=0|spilledBytes=0|time=1|state=ERR|catalog=c|database=d|tables=[0,0,0]|env=[1,8,20]|var=[1]|operators=[39,0,0,0,0,0,0,0,0,0,0]";
         assert!(parse_features_log_line(err_line).unwrap().is_none());
     }
@@ -472,16 +500,14 @@ mod tests {
     #[test]
     fn test_sqlite_stratified_retention_preserves_large_queries_under_small_query_flood() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = SqliteStore::open(tmp.path(), 5).unwrap(); // max 5 per stratum
+        let store = SqliteStore::open(tmp.path(), 5).unwrap();
         let line_base = "digest=d1|cpuCostNs=100|memCostBytes=2000000000|scanBytes=1000|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=EOF|catalog=c|database=d|tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]";
         let mut sample = parse_features_log_line(line_base).unwrap().unwrap();
         let dense = [0.0_f64; 39];
 
-        // Insert 3 large queries (2 GB -> stratum 3)
         for _ in 0..3 {
             store.insert_sample(111, &dense, &sample).unwrap();
         }
-        // Flood with 20 tiny queries (2 MB -> stratum 0)
         sample.effective_mem_bytes = 2_000_000;
         for _ in 0..20 {
             store.insert_sample(222, &dense, &sample).unwrap();
@@ -500,7 +526,7 @@ Expected: FAIL
 
 - [ ] **Step 3: Implement `src/ingest/parser.rs` and `src/storage/sqlite.rs`**
 
-In `parse_features_log_line`, locate `"digest="` via `line.find("digest=")` to strip any log4j prefix, split key-value pairs by `'|'`, parse `tables=[...]...` via `parse_feature_string`, and compute `effective_mem_bytes` via `compute_effective_mem_bytes`. In `SqliteStore`, enable `PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;` and prune only within the matching `mem_stratum` when a stratum exceeds `max_per_stratum`.
+In `parse_features_log_line`, locate `"digest="` via `line.find("digest=")` to strip any log4j prefix, split key-value pairs by `'|'`, parse `tables=[...]...` via `parse_feature_string`, and compute `effective_mem_bytes` via `compute_effective_mem_bytes`. In `SqliteStore`, serialize `DenseFeatureVector` using `rmp_serde::to_vec(&dense.as_slice())` (or 39 little-endian `f64` bytes `39 * 8 = 312` bytes), enable `PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;`, and prune only within the matching `mem_stratum` when a stratum exceeds `max_per_stratum`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -516,7 +542,45 @@ git commit -m "feat(ingest,storage): add features/audit/profile parsers and stra
 
 ---
 
-### Task 6: 3-Tier Ensemble Engine, `ArcSwap` Snapshot & Champion/Challenger Trainer (Wave 3 — Subagent E)
+### Task 6: GitHub Actions CI, Dependabot, `README.md` & `AGENTS.md` (Wave 2 — Subagent E)
+
+**Files:**
+- Create: `.github/workflows/ci.yml`
+- Create: `.github/dependabot.yml`
+- Create: `README.md`
+- Create: `AGENTS.md`
+
+**Interfaces:**
+- Consumes: Spec `docs/superpowers/specs/2026-10-28-starrocks-cost-prediction-service-design.md`
+- Produces:
+  - `.github/workflows/ci.yml`: Runs on `push` (`main`) and `pull_request` with 3 jobs (`fmt`: `cargo fmt --all -- --check`, `clippy`: `cargo clippy --all-targets --all-features -- -D warnings`, `test`: `cargo test --all-targets --all-features`) using `actions/checkout@v7`, `dtolnay/rust-toolchain@stable`, and `Swatinem/rust-cache@v2`.
+  - `.github/dependabot.yml`: Dependabot v2 config monitoring `package-ecosystem: "cargo"` (`directory: "/"`, weekly schedule) and `package-ecosystem: "github-actions"` (`directory: "/"`, weekly schedule).
+  - `README.md`: Comprehensive open-source documentation covering StarRocks `fe.conf` setup (`enable_query_cost_prediction`, `query_cost_prediction_service_address`, `enable_plan_feature_collection`), the 3-Tier ML architecture, API reference (`/predict_csv`, `/health_check`, `/v1/predict`, `/v1/ingest/*`, `/v1/models/status`, `/v1/admin/*`, `/metrics`), configuration env vars, and quickstart instructions.
+  - `AGENTS.md`: Developer & AI coding agent guide documenting architecture invariants, hot-path latency constraints (`p99 < 250µs`, zero-HTTP-500 policy on `/predict_csv`, `TCP_NODELAY`), module map, TDD workflow, and pre-commit commands (`cargo fmt`, `cargo clippy`, `cargo test`).
+
+- [ ] **Step 1: Create `.github/workflows/ci.yml` and `.github/dependabot.yml`**
+
+Write `.github/workflows/ci.yml` and `.github/dependabot.yml` with latest action versions (`actions/checkout@v7`, `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`).
+
+- [ ] **Step 2: Create `README.md` and `AGENTS.md` in repository root**
+
+Write thorough, accurate `README.md` and `AGENTS.md` matching the exact crate structure, StarRocks internals, and endpoints in the spec.
+
+- [ ] **Step 3: Verify YAML syntax and markdown structure**
+
+Run: `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml')); yaml.safe_load(open('.github/dependabot.yml')); print('YAML valid')"` (or verify structure via script if PyYAML isn't installed) and verify files exist at root.
+Expected: Valid YAML and markdown files in place.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add .github/ README.md AGENTS.md
+git commit -m "docs,ci: add GitHub Actions CI, Dependabot config, README.md, and AGENTS.md"
+```
+
+---
+
+### Task 7: 3-Tier Ensemble Engine, `ArcSwap` Snapshot & Champion/Challenger Trainer (Wave 3 — Subagent F)
 
 **Files:**
 - Create: `src/model/ensemble.rs`
@@ -527,12 +591,18 @@ git commit -m "feat(ingest,storage): add features/audit/profile parsers and stra
 **Interfaces:**
 - Consumes: Tasks 1–5 (`TableCatalog`, `PlanSketchCache`, `OnlineRlsCalibrator`, `GbdtModelSet`, `SqliteStore`, `AppConfig`)
 - Produces:
+  - `crate::model::ensemble::HoldoutMetrics` (`#[derive(Clone, Debug, Default, Serialize, Deserialize)]` with `pinball_p90: f64`, `q_error_p50: f64`, `q_error_p90: f64`, `validation_samples: usize`)
+  - `crate::model::ensemble::RetrainReport` (`#[derive(Clone, Debug, Serialize, Deserialize)]` with `promoted: bool`, `model_version: u64`, `training_samples: usize`, `holdout_metrics: HoldoutMetrics`)
+  - `crate::model::ensemble::ModelStatusReport` (`#[derive(Clone, Debug, Serialize, Deserialize)]` with `model_version: u64`, `gbdt_trained: bool`, `sketch_entries: usize`, `known_tables: usize`, `ingested_samples: u64`, `stratum_counts: [usize; 5]`, `live_q_error_ewma: f64`, `circuit_breaker_tripped: bool`, `holdout_metrics: Option<HoldoutMetrics>`)
   - `crate::model::ensemble::EnsembleEngine` with:
-    - `EnsembleEngine::new(config: AppConfig, store: Arc<SqliteStore>) -> Result<Arc<Self>, anyhow::Error>` (hydrates latest snapshot from `SqliteStore` on boot if present)
+    - `EnsembleEngine::new(config: AppConfig, store: Arc<SqliteStore>) -> Result<Arc<Self>, StorageError>`
     - `EnsembleEngine::predict(&self, plan: &CanonicalPlanFeatures, csv_fast_path: bool) -> PredictionOutput`
-    - `EnsembleEngine::observe_execution(&self, sample: &TelemetrySample) -> Result<bool, StorageError>` (updates Tier 1 Sketch, Tier 3 RLS, `TableCatalog`, live Q-Error drift EWMA, inserts into `SqliteStore`, and returns `true` if retrain threshold/drift is reached)
-    - `EnsembleEngine::retrain_and_promote(&self) -> Result<RetrainReport, StorageError>` (trains Challenger `GbdtModelSet`, validates holdout P90 Pinball loss against Champion, swaps `ArcSwap<ActiveGbdtSnapshot>`, and saves snapshot to `SqliteStore`)
+    - `EnsembleEngine::observe_execution(&self, sample: &TelemetrySample) -> Result<bool, StorageError>`
+    - `EnsembleEngine::retrain_and_promote(&self) -> Result<RetrainReport, StorageError>`
     - `EnsembleEngine::status(&self) -> ModelStatusReport`
+    - `EnsembleEngine::set_circuit_breaker(&self, tripped: bool)`
+    - `EnsembleEngine::is_circuit_breaker_tripped(&self) -> bool`
+    - `EnsembleEngine::catalog(&self) -> &TableCatalog`
 
 - [ ] **Step 1: Write failing tests for 3-tier confidence blending, drift detection, and Champion/Challenger promotion in `src/model/ensemble.rs`**
 
@@ -555,11 +625,9 @@ mod tests {
         let plan_a = parse_feature_string(
             "tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]"
         ).unwrap();
-        // Cold start -> dominant tier is rls_tier3
         let pred_cold = engine.predict(&plan_a, false);
         assert_eq!(pred_cold.dominant_tier, "rls_tier3");
 
-        // Ingest 40 varied samples across plans on table 101
         for i in 0..40 {
             let rows_log = 12 + (i % 6);
             let pipe = format!(
@@ -586,7 +654,6 @@ mod tests {
         assert!(report.promoted);
         assert_eq!(engine.status().model_version, 1);
 
-        // Unseen plan shape on known table 101 now uses gbdt_tier2
         let unseen_plan_on_101 = parse_feature_string(
             "tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[36,1,15,100,18,16,0,15,1,0,39,1,15,100,16,14,0,12,2,1,1]"
         ).unwrap();
@@ -603,7 +670,7 @@ Expected: FAIL
 
 - [ ] **Step 3: Implement `src/model/ensemble.rs` and `src/trainer/mod.rs`**
 
-Implement `EnsembleEngine` holding `ArcSwap<Option<ActiveGbdtModel>>`, `PlanSketchCache`, `OnlineRlsCalibrator`, and `TableCatalog`. Implement continuous confidence blending (`w_1 = c_1`, `w_2 = (1 - w_1) * c_2`, `w_3 = 1 - w_1 - w_2`), safety clamping (`[min_predicted_mem_bytes, compute_cluster_max_mem_bytes(...)]`), 10-bit watermark application, and snapshot persistence/hydration via `bincode`.
+Implement `EnsembleEngine` holding `ArcSwap<Option<ActiveGbdtSnapshot>>`, `PlanSketchCache`, `OnlineRlsCalibrator`, and `TableCatalog`. Use `rmp_serde` (MessagePack) to serialize/deserialize full `ModelSnapshot` blobs (`ActiveGbdtSnapshot`, `PlanSketchEntry` vec, `RlsState`, `TableProfile` vec) into `SqliteStore` so restarts hydrate in `< 50ms`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -619,7 +686,7 @@ git commit -m "feat(ensemble,trainer): implement 3-tier confidence blending, Arc
 
 ---
 
-### Task 7: In-Flight Prediction Correlator & Resilient File Tailer (Wave 3 — Subagent F)
+### Task 8: In-Flight Prediction Correlator & Resilient File Tailer (Wave 3 — Subagent G)
 
 **Files:**
 - Create: `src/ingest/correlator.rs`
@@ -680,7 +747,6 @@ mod tests {
 
         let batch1 = FileTailer::poll_once(&log_path, &store).unwrap();
         assert_eq!(batch1.len(), 1);
-        // Second poll with no new data returns 0
         let batch2 = FileTailer::poll_once(&log_path, &store).unwrap();
         assert_eq!(batch2.len(), 0);
     }
@@ -710,7 +776,7 @@ git commit -m "feat(ingest): add watermarked InFlightCache correlator and checkp
 
 ---
 
-### Task 8: Axum HTTP Server, Prometheus Metrics, CLI & End-to-End StarRocks Convergence Suite (Wave 4)
+### Task 9: Axum 0.8 HTTP Server, Prometheus Metrics, CLI & End-to-End StarRocks Convergence Suite (Wave 4)
 
 **Files:**
 - Create: `src/api/mod.rs`
@@ -719,7 +785,7 @@ git commit -m "feat(ingest): add watermarked InFlightCache correlator and checkp
 - Create: `tests/e2e_convergence.rs`
 
 **Interfaces:**
-- Consumes: All modules from Tasks 1–7
+- Consumes: All modules from Tasks 1–8
 - Produces:
   - `crate::api::AppState` & `crate::api::build_router(state: Arc<AppState>) -> axum::Router`
   - Endpoints:
@@ -829,14 +895,14 @@ Expected: FAIL (`api` module not implemented)
 
 Implement all routes in `src/api/mod.rs`, latency histogram counters using `AtomicU64` in `AppState`, and a second test in `tests/e2e_convergence.rs` (`test_end_to_end_ingest_retrain_and_multi_target_prediction`) that ingests 60 `fe.features.log` lines, triggers `/v1/admin/retrain`, verifies `GET /v1/models/status` reports `gbdt_trained: true`, and verifies `POST /v1/predict` returns accurate `predicted_mem_bytes_p90`, `predicted_scan_bytes`, and `predicted_return_rows`.
 
-- [ ] **Step 4: Run full test suite to verify everything passes**
+- [ ] **Step 4: Run full formatting, linting, and test verification suite**
 
-Run: `cargo test`
-Expected: PASS (all unit and integration tests passing with zero warnings)
+Run: `cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-targets --all-features`
+Expected: PASS (0 warnings, all unit and E2E tests passing)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/ tests/
-git commit -m "feat(api): add Axum HTTP endpoints, Prometheus metrics, and E2E StarRocks convergence suite"
+git commit -m "feat(api): add Axum 0.8 HTTP server, Prometheus metrics, and E2E StarRocks convergence suite"
 ```
