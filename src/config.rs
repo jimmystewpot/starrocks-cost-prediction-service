@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -32,55 +33,123 @@ impl Default for AppConfig {
     }
 }
 
+fn read_env_var(keys: &[&str]) -> Option<(String, String)> {
+    for &key in keys {
+        if let Ok(val) = std::env::var(key) {
+            return Some((key.to_string(), val));
+        }
+    }
+    None
+}
+
+fn parse_env_var<T: FromStr>(keys: &[&str], target: &mut T) {
+    if let Some((key, raw)) = read_env_var(keys) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        match trimmed.parse::<T>() {
+            Ok(parsed) => *target = parsed,
+            Err(_) => {
+                tracing::warn!(
+                    env_var = %key,
+                    raw_value = %raw,
+                    "ignoring malformed environment variable value; using default"
+                );
+            }
+        }
+    }
+}
+
 impl AppConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_BIND_ADDR") {
-            cfg.bind_addr = v;
+
+        if let Some((_, v)) = read_env_var(&[
+            "STARROCKS_COST_PREDICTOR_BIND_ADDR",
+            "SR_PREDICTOR_BIND_ADDR",
+        ]) && !v.trim().is_empty()
+        {
+            cfg.bind_addr = v.trim().to_string();
         }
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_DB_PATH") {
-            cfg.db_path = PathBuf::from(v);
-        }
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_FEATURES_LOG_PATH")
+
+        if let Some((_, v)) =
+            read_env_var(&["STARROCKS_COST_PREDICTOR_DB_PATH", "SR_PREDICTOR_DB_PATH"])
             && !v.trim().is_empty()
         {
-            cfg.features_log_path = Some(PathBuf::from(v));
+            cfg.db_path = PathBuf::from(v.trim());
         }
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_MIN_MEM_BYTES")
-            && let Ok(parsed) = v.parse()
+
+        if let Some((_, v)) = read_env_var(&[
+            "STARROCKS_COST_PREDICTOR_FEATURES_LOG_PATH",
+            "SR_PREDICTOR_FEATURES_LOG_PATH",
+        ]) && !v.trim().is_empty()
         {
-            cfg.min_predicted_mem_bytes = parsed;
+            cfg.features_log_path = Some(PathBuf::from(v.trim()));
         }
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_FALLBACK_MEM_BYTES")
-            && let Ok(parsed) = v.parse()
-        {
-            cfg.fallback_mem_bytes = parsed;
-        }
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_MAX_CLUSTER_MEM_MULTIPLIER")
-            && let Ok(parsed) = v.parse()
-        {
-            cfg.max_cluster_mem_multiplier = parsed;
-        }
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_MAX_SKETCH_ENTRIES")
-            && let Ok(parsed) = v.parse()
-        {
-            cfg.max_sketch_entries = parsed;
-        }
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_MIN_NEW_SAMPLES_FOR_RETRAIN")
-            && let Ok(parsed) = v.parse()
-        {
-            cfg.min_new_samples_for_retrain = parsed;
-        }
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_RETRAIN_INTERVAL_SECS")
-            && let Ok(parsed) = v.parse()
-        {
-            cfg.retrain_interval_secs = parsed;
-        }
-        if let Ok(v) = std::env::var("STARROCKS_COST_PREDICTOR_DRIFT_Q_ERROR_THRESHOLD")
-            && let Ok(parsed) = v.parse()
-        {
-            cfg.drift_q_error_threshold = parsed;
-        }
+
+        parse_env_var(
+            &[
+                "STARROCKS_COST_PREDICTOR_MIN_MEM_BYTES",
+                "STARROCKS_COST_PREDICTOR_MIN_PREDICTED_MEM_BYTES",
+                "SR_PREDICTOR_MIN_PREDICTED_MEM_BYTES",
+                "SR_PREDICTOR_MIN_MEM_BYTES",
+            ],
+            &mut cfg.min_predicted_mem_bytes,
+        );
+
+        parse_env_var(
+            &[
+                "STARROCKS_COST_PREDICTOR_FALLBACK_MEM_BYTES",
+                "SR_PREDICTOR_FALLBACK_MEM_BYTES",
+            ],
+            &mut cfg.fallback_mem_bytes,
+        );
+
+        parse_env_var(
+            &[
+                "STARROCKS_COST_PREDICTOR_MAX_CLUSTER_MEM_MULTIPLIER",
+                "STARROCKS_COST_PREDICTOR_MAX_MEM_MULTIPLIER",
+                "SR_PREDICTOR_MAX_MEM_SAFETY_MULTIPLIER",
+                "SR_PREDICTOR_MAX_CLUSTER_MEM_MULTIPLIER",
+            ],
+            &mut cfg.max_cluster_mem_multiplier,
+        );
+
+        parse_env_var(
+            &[
+                "STARROCKS_COST_PREDICTOR_MAX_SKETCH_ENTRIES",
+                "SR_PREDICTOR_MAX_SKETCH_ENTRIES",
+            ],
+            &mut cfg.max_sketch_entries,
+        );
+
+        parse_env_var(
+            &[
+                "STARROCKS_COST_PREDICTOR_MIN_NEW_SAMPLES_FOR_RETRAIN",
+                "STARROCKS_COST_PREDICTOR_MIN_SAMPLES_FOR_RETRAIN",
+                "SR_PREDICTOR_MIN_NEW_SAMPLES_FOR_RETRAIN",
+                "SR_PREDICTOR_MIN_SAMPLES_FOR_RETRAIN",
+            ],
+            &mut cfg.min_new_samples_for_retrain,
+        );
+
+        parse_env_var(
+            &[
+                "STARROCKS_COST_PREDICTOR_RETRAIN_INTERVAL_SECS",
+                "SR_PREDICTOR_RETRAIN_INTERVAL_SECS",
+            ],
+            &mut cfg.retrain_interval_secs,
+        );
+
+        parse_env_var(
+            &[
+                "STARROCKS_COST_PREDICTOR_DRIFT_Q_ERROR_THRESHOLD",
+                "SR_PREDICTOR_DRIFT_Q_ERROR_THRESHOLD",
+            ],
+            &mut cfg.drift_q_error_threshold,
+        );
+
         cfg
     }
 }
