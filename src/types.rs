@@ -62,21 +62,47 @@ pub struct TelemetrySample {
     pub timestamp_s: u64,
 }
 
-fn deserialize_static_str<'de, D>(deserializer: D) -> Result<&'static str, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    match s.as_str() {
-        "sketch_tier1" => Ok("sketch_tier1"),
-        "gbdt_tier2" => Ok("gbdt_tier2"),
-        "rls_tier3" => Ok("rls_tier3"),
-        "fallback" => Ok("fallback"),
-        _ => Ok(Box::leak(s.into_boxed_str())),
+#[derive(Deserialize)]
+struct PredictionOutputDe {
+    predicted_mem_bytes_p90: u64,
+    predicted_mem_bytes_p50: u64,
+    predicted_scan_bytes: u64,
+    predicted_return_rows: u64,
+    predicted_cpu_cost_ns: u64,
+    spill_probability: f64,
+    confidence: f64,
+    tier_weights: [f64; 3],
+    dominant_tier: String,
+    model_version: u64,
+    latency_us: u64,
+}
+
+impl From<PredictionOutputDe> for PredictionOutput {
+    fn from(de: PredictionOutputDe) -> Self {
+        let dominant_tier: &'static str = match de.dominant_tier.as_str() {
+            "sketch_tier1" => "sketch_tier1",
+            "gbdt_tier2" => "gbdt_tier2",
+            "rls_tier3" => "rls_tier3",
+            "fallback" => "fallback",
+            _ => Box::leak(de.dominant_tier.into_boxed_str()),
+        };
+        Self {
+            predicted_mem_bytes_p90: de.predicted_mem_bytes_p90,
+            predicted_mem_bytes_p50: de.predicted_mem_bytes_p50,
+            predicted_scan_bytes: de.predicted_scan_bytes,
+            predicted_return_rows: de.predicted_return_rows,
+            predicted_cpu_cost_ns: de.predicted_cpu_cost_ns,
+            spill_probability: de.spill_probability,
+            confidence: de.confidence,
+            tier_weights: de.tier_weights,
+            dominant_tier,
+            model_version: de.model_version,
+            latency_us: de.latency_us,
+        }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PredictionOutput {
     pub predicted_mem_bytes_p90: u64,
     pub predicted_mem_bytes_p50: u64,
@@ -86,10 +112,19 @@ pub struct PredictionOutput {
     pub spill_probability: f64,
     pub confidence: f64,
     pub tier_weights: [f64; 3],
-    #[serde(deserialize_with = "deserialize_static_str")]
     pub dominant_tier: &'static str,
     pub model_version: u64,
     pub latency_us: u64,
+}
+
+impl<'de> Deserialize<'de> for PredictionOutput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let de = PredictionOutputDe::deserialize(deserializer)?;
+        Ok(Self::from(de))
+    }
 }
 
 pub fn watermark_mem_bytes(raw_bytes: u64, plan_hash: u64, min_bytes: u64) -> u64 {
