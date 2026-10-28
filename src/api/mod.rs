@@ -182,23 +182,54 @@ pub struct PredictRequest {
     pub csv: Option<String>,
 }
 
-async fn handle_v1_predict(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<PredictRequest>,
-) -> impl IntoResponse {
+async fn handle_v1_predict(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
     let start = Instant::now();
     state
         .v1_predict_requests_total
         .fetch_add(1, Ordering::Relaxed);
 
-    let plan_res = if let Some(ref fs) = req.feature_string
-        && !fs.trim().is_empty()
-    {
-        parse_feature_string(fs)
-    } else if let Some(ref csv) = req.csv
-        && !csv.trim().is_empty()
-    {
-        parse_predict_csv(csv)
+    let body_str = match std::str::from_utf8(&body) {
+        Ok(s) => s.trim(),
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let plan_res = if body_str.starts_with('{') {
+        match serde_json::from_str::<PredictRequest>(body_str) {
+            Ok(req) => {
+                if let Some(ref fs) = req.feature_string
+                    && !fs.trim().is_empty()
+                {
+                    parse_feature_string(fs)
+                } else if let Some(ref csv) = req.csv
+                    && !csv.trim().is_empty()
+                {
+                    parse_predict_csv(csv)
+                } else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "request must provide non-empty 'feature_string' or 'csv'" })),
+                    )
+                        .into_response();
+                }
+            }
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    } else if body_str.contains("tables=") && body_str.contains("operators=") {
+        parse_feature_string(body_str)
+    } else if !body_str.is_empty() {
+        parse_predict_csv(body_str)
     } else {
         return (
             StatusCode::BAD_REQUEST,

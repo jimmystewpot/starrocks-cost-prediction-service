@@ -552,7 +552,7 @@ cd starrocks-cost-prediction-service
 # Build optimized release binary
 cargo build --release
 
-# The compiled binary is located at target/release/starrocks-cost-predictor
+# The compiled binary is located at target/release/starrocks-cost-prediction-service
 ```
 
 ### Running the Service
@@ -564,7 +564,7 @@ export SR_PREDICTOR_DB_PATH="data/cost_predictor.db"
 export SR_PREDICTOR_FEATURES_LOG_PATH="/opt/starrocks/fe/log/fe.features.log"
 
 # Run the daemon
-./target/release/starrocks-cost-predictor
+./target/release/starrocks-cost-prediction-service
 ```
 
 ### Running Tests
@@ -593,10 +593,10 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=builder /app/target/release/starrocks-cost-predictor /app/starrocks-cost-predictor
+COPY --from=builder /app/target/release/starrocks-cost-prediction-service /app/starrocks-cost-prediction-service
 EXPOSE 8080
 VOLUME ["/app/data"]
-ENTRYPOINT ["/app/starrocks-cost-predictor"]
+ENTRYPOINT ["/app/starrocks-cost-prediction-service"]
 ```
 
 Run container:

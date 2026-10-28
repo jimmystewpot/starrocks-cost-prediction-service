@@ -344,6 +344,7 @@ impl EnsembleEngine {
                 holdout_metrics: challenger_metrics,
             })
         } else {
+            self.samples_since_retrain.store(0, Ordering::Relaxed);
             Ok(RetrainReport {
                 promoted: false,
                 model_version: current_ver,
