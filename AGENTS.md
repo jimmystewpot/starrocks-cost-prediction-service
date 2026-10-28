@@ -55,28 +55,27 @@ src/
 │   └── catalog.rs      # TableCatalog with DashMap for target-encoded table profiles (15 features)
 │
 ├── model/              # 3-Tier ML Model Ensemble
-│   ├── mod.rs          # ModelSnapshot, ModelRegistry, and ArcSwap pointer management
+│   ├── mod.rs          # Model submodule re-exports
+│   ├── ensemble.rs     # EnsembleEngine, ModelSnapshot, and ArcSwap pointer management
 │   ├── sketch.rs       # Tier 1: Plan-hash EWMA sketch cache with cardinality scaling
 │   ├── gbdt.rs         # Tier 2: Pure-Rust GBDT regressor (Huber loss & P90 Pinball loss)
 │   └── rls.rs          # Tier 3: Online Recursive Least Squares (RLS) CBO calibrator
 │
 ├── ingest/             # Asynchronous query telemetry ingestion
 │   ├── mod.rs          # Ingestion submodule re-exports
-│   └── parser.rs       # fe.features.log parser, profile parser, and InFlightCache ring buffer
+│   ├── parser.rs       # fe.features.log parser, AuditLogEvent parser, and profile parser
+│   ├── correlator.rs   # 10-bit watermarked InFlightCache correlator
+│   └── tailer.rs       # Resilient checkpointed FileTailer for fe.features.log
 │
 ├── storage/            # Embedded analytical persistence
 │   ├── mod.rs          # Storage submodule re-exports
 │   └── sqlite.rs       # SQLite WAL embedded engine, stratified sample compaction, model snapshots
 │
 ├── trainer/            # Background retraining pipeline (dedicated Rayon thread pool)
-│   ├── mod.rs          # Background retrain loop, drift detection, champion/challenger gate
+│   └── mod.rs          # Holdout split, P90 Pinball & Q-Error evaluation, champion/challenger gate
 │
 └── api/                # Axum HTTP routes & handlers
-    ├── mod.rs          # Router construction, middleware, TCP_NODELAY listener
-    ├── predict.rs      # POST /predict_csv & POST /v1/predict handlers
-    ├── ingest.rs       # POST /v1/ingest/* handlers
-    ├── health.rs       # GET /health_check & GET /metrics
-    └── admin.rs        # GET /v1/models/status, POST /v1/admin/*
+    └── mod.rs          # Router construction, /predict_csv, /v1/*, /health_check, /metrics handlers
 ```
 
 ---
