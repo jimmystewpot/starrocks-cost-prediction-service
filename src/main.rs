@@ -94,33 +94,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut ticker = tokio::time::interval(Duration::from_secs(2));
             loop {
                 ticker.tick().await;
-                if !log_path.exists() {
-                    continue;
-                }
-                match FileTailer::poll_once(&log_path, &tailer_state.store) {
-                    Ok(samples) if !samples.is_empty() => {
+                let poll_path = log_path.clone();
+                let poll_state = tailer_state.clone();
+                let join_res = tokio::task::spawn_blocking(move || {
+                    if !poll_path.exists() {
+                        return Ok(());
+                    }
+                    let samples = FileTailer::poll_once(&poll_path, &poll_state.store)?;
+                    if !samples.is_empty() {
                         let count = samples.len() as u64;
                         let mut should_retrain = false;
                         for sample in &samples {
-                            if let Ok(trigger) = tailer_state.engine.observe_execution(sample)
+                            if let Ok(trigger) = poll_state.engine.observe_execution(sample)
                                 && trigger
                             {
                                 should_retrain = true;
                             }
                         }
-                        tailer_state
+                        poll_state
                             .ingest_features_total
                             .fetch_add(count, Ordering::Relaxed);
                         if should_retrain {
-                            tailer_state.retrain_notify.notify_one();
+                            poll_state.retrain_notify.notify_one();
                         }
                     }
-                    Ok(_) => {}
-                    Err(err) => {
+                    Ok::<(), std::io::Error>(())
+                })
+                .await;
+
+                match join_res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
                         tracing::warn!(
                             path = %log_path.display(),
                             error = %err,
                             "file tailer poll error"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %log_path.display(),
+                            error = %err,
+                            "file tailer blocking task panicked"
                         );
                     }
                 }
