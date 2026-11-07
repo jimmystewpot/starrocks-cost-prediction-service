@@ -8,7 +8,7 @@ use crate::types::{TelemetrySample, compute_effective_mem_bytes};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State, rejection::BytesRejection},
     http::{StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
@@ -23,6 +23,8 @@ use tokio::sync::Notify;
 const DEFAULT_MAX_SAMPLES_PER_STRATUM: usize = 10_000;
 const DEFAULT_INFLIGHT_CAPACITY: usize = 50_000;
 const DEFAULT_INFLIGHT_TTL_SECS: u64 = 1_800;
+const PREDICT_BODY_LIMIT_BYTES: usize = 256 * 1024;
+const INGEST_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct AppState {
     pub config: AppConfig,
@@ -115,12 +117,27 @@ impl AppState {
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/predict_csv", post(handle_predict_csv))
+        .route(
+            "/predict_csv",
+            post(handle_predict_csv).layer(DefaultBodyLimit::max(PREDICT_BODY_LIMIT_BYTES)),
+        )
         .route("/health_check", get(handle_health_check))
-        .route("/v1/predict", post(handle_v1_predict))
-        .route("/v1/ingest/features", post(handle_ingest_features))
-        .route("/v1/ingest/audit", post(handle_ingest_audit))
-        .route("/v1/ingest/profile", post(handle_ingest_profile))
+        .route(
+            "/v1/predict",
+            post(handle_v1_predict).layer(DefaultBodyLimit::max(PREDICT_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/ingest/features",
+            post(handle_ingest_features).layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/ingest/audit",
+            post(handle_ingest_audit).layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/ingest/profile",
+            post(handle_ingest_profile).layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT_BYTES)),
+        )
         .route("/v1/models/status", get(handle_models_status))
         .route("/v1/admin/retrain", post(handle_admin_retrain))
         .route(
@@ -131,11 +148,29 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn handle_predict_csv(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+async fn handle_predict_csv(
+    State(state): State<Arc<AppState>>,
+    body_res: Result<Bytes, BytesRejection>,
+) -> impl IntoResponse {
     let start = Instant::now();
     state
         .predict_csv_requests_total
         .fetch_add(1, Ordering::Relaxed);
+
+    let body = match body_res {
+        Ok(b) => b,
+        Err(rejection) => {
+            state
+                .predict_csv_fallback_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                error = %rejection,
+                "predict_csv body rejected; returning fallback_mem_bytes"
+            );
+            state.observe_latency_ns(start.elapsed().as_nanos() as u64);
+            return (StatusCode::OK, state.config.fallback_mem_bytes.to_string());
+        }
+    };
 
     let Ok(csv_str) = std::str::from_utf8(&body) else {
         state
@@ -264,21 +299,21 @@ async fn handle_ingest_features(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let body_str = String::from_utf8_lossy(&body);
-    let trimmed = body_str.trim();
-    if trimmed.is_empty() {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ingested": 0, "errors": 0 })),
-        );
-    }
+    let join_res = tokio::task::spawn_blocking(move || {
+        let body_str = String::from_utf8_lossy(&body);
+        let trimmed = body_str.trim();
+        if trimmed.is_empty() {
+            return (0_u64, 0_u64);
+        }
 
-    let mut ingested = 0_u64;
-    let mut errors = 0_u64;
-    let mut notify_retrain = false;
+        let mut ingested = 0_u64;
+        let mut errors = 0_u64;
+        let mut notify_retrain = false;
 
-    let process_line =
-        |line: &str, ingested: &mut u64, errors: &mut u64, notify_retrain: &mut bool| {
+        let process_line = |line: &str,
+                            ingested: &mut u64,
+                            errors: &mut u64,
+                            notify_retrain: &mut bool| {
             if line.trim().is_empty() {
                 return;
             }
@@ -303,32 +338,44 @@ async fn handle_ingest_features(
             }
         };
 
-    if trimmed.starts_with('{')
-        && let Ok(env) = serde_json::from_str::<FeaturesJsonEnvelope>(trimmed)
-    {
-        for line in &env.lines {
-            process_line(line, &mut ingested, &mut errors, &mut notify_retrain);
+        if trimmed.starts_with('{')
+            && let Ok(env) = serde_json::from_str::<FeaturesJsonEnvelope>(trimmed)
+        {
+            for line in &env.lines {
+                process_line(line, &mut ingested, &mut errors, &mut notify_retrain);
+            }
+        } else {
+            for line in trimmed.lines() {
+                process_line(line, &mut ingested, &mut errors, &mut notify_retrain);
+            }
         }
-    } else {
-        for line in trimmed.lines() {
-            process_line(line, &mut ingested, &mut errors, &mut notify_retrain);
+
+        state
+            .ingest_features_total
+            .fetch_add(ingested, Ordering::Relaxed);
+        if notify_retrain {
+            state.retrain_notify.notify_one();
         }
-    }
 
-    state
-        .ingest_features_total
-        .fetch_add(ingested, Ordering::Relaxed);
-    if notify_retrain {
-        state.retrain_notify.notify_one();
-    }
+        (ingested, errors)
+    })
+    .await;
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ingested": ingested,
-            "errors": errors,
-        })),
-    )
+    match join_res {
+        Ok((ingested, errors)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ingested": ingested,
+                "errors": errors,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -340,66 +387,76 @@ enum AuditIngestPayload {
 }
 
 async fn handle_ingest_audit(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
-    let body_str = String::from_utf8_lossy(&body);
-    let trimmed = body_str.trim();
-    if trimmed.is_empty() {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "correlated": 0, "unmatched": 0 })),
-        );
-    }
-
-    let events: Vec<AuditLogEvent> =
-        if let Ok(parsed) = serde_json::from_str::<AuditIngestPayload>(trimmed) {
-            match parsed {
-                AuditIngestPayload::Single(ev) => vec![ev],
-                AuditIngestPayload::Batch(list) => list,
-                AuditIngestPayload::Envelope { events } => events,
-            }
-        } else {
-            let mut list = Vec::new();
-            for line in trimmed.lines() {
-                let l = line.trim();
-                if !l.is_empty()
-                    && let Ok(ev) = serde_json::from_str::<AuditLogEvent>(l)
-                {
-                    list.push(ev);
-                }
-            }
-            list
-        };
-
-    let mut correlated = 0_u64;
-    let mut unmatched = 0_u64;
-    let mut notify_retrain = false;
-
-    for ev in &events {
-        if let Some(sample) = state.inflight.correlate_audit_event(ev) {
-            if let Ok(should_retrain) = state.engine.observe_execution(&sample) {
-                correlated += 1;
-                if should_retrain {
-                    notify_retrain = true;
-                }
-            }
-        } else {
-            unmatched += 1;
+    let join_res = tokio::task::spawn_blocking(move || {
+        let body_str = String::from_utf8_lossy(&body);
+        let trimmed = body_str.trim();
+        if trimmed.is_empty() {
+            return (0_u64, 0_u64);
         }
-    }
 
-    state
-        .ingest_audit_total
-        .fetch_add(correlated, Ordering::Relaxed);
-    if notify_retrain {
-        state.retrain_notify.notify_one();
-    }
+        let events: Vec<AuditLogEvent> =
+            if let Ok(parsed) = serde_json::from_str::<AuditIngestPayload>(trimmed) {
+                match parsed {
+                    AuditIngestPayload::Single(ev) => vec![ev],
+                    AuditIngestPayload::Batch(list) => list,
+                    AuditIngestPayload::Envelope { events } => events,
+                }
+            } else {
+                let mut list = Vec::new();
+                for line in trimmed.lines() {
+                    let l = line.trim();
+                    if !l.is_empty()
+                        && let Ok(ev) = serde_json::from_str::<AuditLogEvent>(l)
+                    {
+                        list.push(ev);
+                    }
+                }
+                list
+            };
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "correlated": correlated,
-            "unmatched": unmatched,
-        })),
-    )
+        let mut correlated = 0_u64;
+        let mut unmatched = 0_u64;
+        let mut notify_retrain = false;
+
+        for ev in &events {
+            if let Some(sample) = state.inflight.correlate_audit_event(ev) {
+                if let Ok(should_retrain) = state.engine.observe_execution(&sample) {
+                    correlated += 1;
+                    if should_retrain {
+                        notify_retrain = true;
+                    }
+                }
+            } else {
+                unmatched += 1;
+            }
+        }
+
+        state
+            .ingest_audit_total
+            .fetch_add(correlated, Ordering::Relaxed);
+        if notify_retrain {
+            state.retrain_notify.notify_one();
+        }
+
+        (correlated, unmatched)
+    })
+    .await;
+
+    match join_res {
+        Ok((correlated, unmatched)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "correlated": correlated,
+                "unmatched": unmatched,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -415,19 +472,19 @@ async fn handle_ingest_profile(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let body_str = String::from_utf8_lossy(&body);
-    let trimmed = body_str.trim();
+    let join_res = tokio::task::spawn_blocking(move || {
+        let body_str = String::from_utf8_lossy(&body);
+        let trimmed = body_str.trim();
 
-    let (profile_payload, digest_opt, feature_str_opt) = if trimmed.starts_with('{')
-        && let Ok(env) = serde_json::from_str::<ProfileEnvelope>(trimmed)
-    {
-        (env.profile, env.digest, env.feature_string)
-    } else {
-        (trimmed.to_string(), None, None)
-    };
+        let (profile_payload, digest_opt, feature_str_opt) = if trimmed.starts_with('{')
+            && let Ok(env) = serde_json::from_str::<ProfileEnvelope>(trimmed)
+        {
+            (env.profile, env.digest, env.feature_string)
+        } else {
+            (trimmed.to_string(), None, None)
+        };
 
-    match parse_query_profile(&profile_payload) {
-        Ok(summary) => {
+        parse_query_profile(&profile_payload).inspect(|summary| {
             state.ingest_profile_total.fetch_add(1, Ordering::Relaxed);
 
             if let Some(ref fs) = feature_str_opt
@@ -472,11 +529,19 @@ async fn handle_ingest_profile(
                     summary.spilled_bytes > 0,
                 );
             }
+        })
+    })
+    .await;
 
-            (StatusCode::OK, Json(summary)).into_response()
-        }
-        Err(err) => (
+    match join_res {
+        Ok(Ok(summary)) => (StatusCode::OK, Json(summary)).into_response(),
+        Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": err.to_string() })),
         )
             .into_response(),

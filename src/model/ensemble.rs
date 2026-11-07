@@ -64,6 +64,14 @@ pub struct ModelSnapshot {
     pub live_q_error_ewma: f64,
 }
 
+pub struct RetrainGuard<'a>(&'a AtomicBool);
+
+impl Drop for RetrainGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub struct EnsembleEngine {
     config: AppConfig,
     store: Arc<SqliteStore>,
@@ -76,6 +84,7 @@ pub struct EnsembleEngine {
     samples_since_retrain: AtomicUsize,
     live_q_error_ewma_bits: AtomicU64,
     circuit_breaker_tripped: AtomicBool,
+    retrain_in_progress: AtomicBool,
 }
 
 fn log_to_u64(log_val: f64) -> u64 {
@@ -122,7 +131,15 @@ impl EnsembleEngine {
             samples_since_retrain: AtomicUsize::new(0),
             live_q_error_ewma_bits: AtomicU64::new(live_q_error_ewma.to_bits()),
             circuit_breaker_tripped: AtomicBool::new(false),
+            retrain_in_progress: AtomicBool::new(false),
         }))
+    }
+
+    pub fn try_acquire_retrain_guard(&self) -> Option<RetrainGuard<'_>> {
+        self.retrain_in_progress
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| RetrainGuard(&self.retrain_in_progress))
     }
 
     pub fn predict(&self, plan: &CanonicalPlanFeatures, csv_fast_path: bool) -> PredictionOutput {
@@ -304,6 +321,15 @@ impl EnsembleEngine {
     }
 
     pub fn retrain_and_promote(&self) -> Result<RetrainReport, StorageError> {
+        let Some(_retrain_guard) = self.try_acquire_retrain_guard() else {
+            return Ok(RetrainReport {
+                promoted: false,
+                model_version: self.model_version.load(Ordering::Relaxed),
+                training_samples: 0,
+                holdout_metrics: HoldoutMetrics::default(),
+            });
+        };
+
         let rows = self.store.load_training_rows()?;
         let training_samples = rows.len();
         let current_ver = self.model_version.load(Ordering::Relaxed);
@@ -419,14 +445,24 @@ impl EnsembleEngine {
     }
 
     fn update_q_error_ewma(&self, log_q_err: f64) {
-        let prev = self.live_q_error_ewma();
-        let next = if prev == 0.0 {
-            log_q_err
-        } else {
-            (1.0 - Q_ERROR_EWMA_ALPHA) * prev + Q_ERROR_EWMA_ALPHA * log_q_err
-        };
-        self.live_q_error_ewma_bits
-            .store(next.to_bits(), Ordering::Relaxed);
+        let mut prev_bits = self.live_q_error_ewma_bits.load(Ordering::Relaxed);
+        loop {
+            let prev = f64::from_bits(prev_bits);
+            let next = if prev == 0.0 {
+                log_q_err
+            } else {
+                (1.0 - Q_ERROR_EWMA_ALPHA) * prev + Q_ERROR_EWMA_ALPHA * log_q_err
+            };
+            match self.live_q_error_ewma_bits.compare_exchange_weak(
+                prev_bits,
+                next.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev_bits = actual,
+            }
+        }
     }
 }
 
@@ -555,5 +591,58 @@ mod tests {
         restored.set_circuit_breaker(true);
         assert!(restored.is_circuit_breaker_tripped());
         assert!(restored.status().circuit_breaker_tripped);
+    }
+
+    #[test]
+    fn test_single_flight_retrain_guard_coalesces_concurrent_calls() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let cfg = AppConfig {
+            db_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let store = Arc::new(SqliteStore::open(&cfg.db_path, 1000).unwrap());
+        let engine = EnsembleEngine::new(cfg, store).unwrap();
+
+        for i in 0..30 {
+            let rows_log = 11 + (i % 5);
+            let pipe = format!(
+                "tables=[0,0,303]|env=[3,16,24]|var=[8]|operators=[39,1,{},100,16,14,0,12,2,1,1]",
+                rows_log
+            );
+            let pf = parse_feature_string(&pipe).unwrap();
+            let sample = TelemetrySample {
+                digest: format!("g{}", i),
+                plan_features: pf,
+                effective_mem_bytes: 70_000_000 + (rows_log as u64) * 6_000_000,
+                scan_bytes: 12_000_000,
+                scan_rows: 40_000,
+                return_rows: 400,
+                cpu_cost_ns: 90_000_000,
+                spilled_bytes: 0,
+                query_time_ms: 25,
+                state: "EOF".to_string(),
+                timestamp_s: 1700002000 + i as u64,
+            };
+            engine.observe_execution(&sample).unwrap();
+        }
+
+        // Simulate an active retrain in progress
+        let guard = engine
+            .try_acquire_retrain_guard()
+            .expect("should acquire guard when idle");
+        assert!(engine.try_acquire_retrain_guard().is_none());
+
+        // Concurrent call to retrain_and_promote must coalesce and return immediately
+        let skipped = engine.retrain_and_promote().unwrap();
+        assert!(!skipped.promoted);
+        assert_eq!(skipped.training_samples, 0);
+        assert_eq!(skipped.model_version, 0);
+
+        // Once the guard is dropped, retrain_and_promote succeeds normally
+        drop(guard);
+        let promoted = engine.retrain_and_promote().unwrap();
+        assert!(promoted.promoted);
+        assert_eq!(promoted.training_samples, 30);
+        assert_eq!(promoted.model_version, 1);
     }
 }

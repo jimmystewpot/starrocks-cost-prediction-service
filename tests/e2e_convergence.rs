@@ -285,3 +285,58 @@ async fn test_end_to_end_ingest_retrain_and_multi_target_prediction() {
     assert!(metrics_str.contains("starrocks_cost_predictor_model_version 1"));
     assert!(metrics_str.contains("starrocks_cost_predictor_predict_csv_requests_total 1"));
 }
+
+#[tokio::test]
+async fn test_predict_csv_oversized_payload_returns_200_fallback_not_413() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let cfg = AppConfig {
+        db_path: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let state = Arc::new(AppState::new(cfg).unwrap());
+    let app = build_router(state.clone());
+
+    let mut oversized_csv = String::from(
+        "tables_0,tables_1,tables_2,env_0,env_1,env_2,var_0,operators_0,operators_1,operators_2,operators_3,operators_4,operators_5,operators_6,operators_7,operators_8,operators_9,operators_10\n0,0,1001,3,16,24,8,39,1,15,100,18,16,0,12,3,2,2\n",
+    );
+    oversized_csv.push_str(&" ".repeat(300 * 1024));
+    let oversized = oversized_csv.into_bytes();
+
+    // 1. POST /predict_csv with >256 KiB payload MUST return 200 OK with fallback_mem_bytes (67108864), NEVER 413!
+    let res_csv = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/predict_csv")
+                .header("content-type", "text/csv")
+                .body(Body::from(oversized.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_csv.status(), StatusCode::OK);
+    let body_bytes = res_csv.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap().trim();
+    assert_eq!(body_str, "67108864");
+    assert_eq!(
+        state
+            .predict_csv_fallback_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    // 2. POST /v1/predict with >256 KiB payload MUST return 413 Payload Too Large
+    let res_v1 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/predict")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_v1.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
