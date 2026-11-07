@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 const EWMA_ALPHA: f64 = 0.20;
 const KNOWN_TABLE_MIN_EXECS: u64 = 5;
 const DEFAULT_LOG_BYTES_PER_ROW: f64 = 4.0;
+const MAX_CATALOG_TABLES: usize = 50_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TableProfile {
@@ -15,15 +16,27 @@ pub struct TableProfile {
     pub ewma_spill_rate: f64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TableCatalog {
     profiles: DashMap<String, TableProfile>,
+    max_tables: usize,
+}
+
+impl Default for TableCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TableCatalog {
     pub fn new() -> Self {
+        Self::with_capacity(MAX_CATALOG_TABLES)
+    }
+
+    pub fn with_capacity(max_tables: usize) -> Self {
         Self {
             profiles: DashMap::new(),
+            max_tables: max_tables.max(1),
         }
     }
 
@@ -56,26 +69,40 @@ impl TableCatalog {
             if trimmed.is_empty() || trimmed == "0" {
                 continue;
             }
-            self.profiles
-                .entry(trimmed.to_string())
-                .and_modify(|p| {
-                    p.exec_count = p.exec_count.saturating_add(1);
-                    p.ewma_log_scan_bytes =
-                        (1.0 - EWMA_ALPHA) * p.ewma_log_scan_bytes + EWMA_ALPHA * log_scan_bytes;
-                    p.ewma_log_bytes_per_row = (1.0 - EWMA_ALPHA) * p.ewma_log_bytes_per_row
-                        + EWMA_ALPHA * log_bytes_per_row;
-                    p.ewma_mem_multiplier_log = (1.0 - EWMA_ALPHA) * p.ewma_mem_multiplier_log
-                        + EWMA_ALPHA * mem_multiplier_log;
-                    p.ewma_spill_rate =
-                        (1.0 - EWMA_ALPHA) * p.ewma_spill_rate + EWMA_ALPHA * spill_val;
-                })
-                .or_insert(TableProfile {
+            if let Some(mut p) = self.profiles.get_mut(trimmed) {
+                p.exec_count = p.exec_count.saturating_add(1);
+                p.ewma_log_scan_bytes =
+                    (1.0 - EWMA_ALPHA) * p.ewma_log_scan_bytes + EWMA_ALPHA * log_scan_bytes;
+                p.ewma_log_bytes_per_row =
+                    (1.0 - EWMA_ALPHA) * p.ewma_log_bytes_per_row + EWMA_ALPHA * log_bytes_per_row;
+                p.ewma_mem_multiplier_log = (1.0 - EWMA_ALPHA) * p.ewma_mem_multiplier_log
+                    + EWMA_ALPHA * mem_multiplier_log;
+                p.ewma_spill_rate = (1.0 - EWMA_ALPHA) * p.ewma_spill_rate + EWMA_ALPHA * spill_val;
+                continue;
+            }
+
+            if self.profiles.len() >= self.max_tables {
+                let victim = self
+                    .profiles
+                    .iter()
+                    .take(64)
+                    .min_by_key(|e| e.value().exec_count)
+                    .map(|e| e.key().clone());
+                if let Some(v) = victim {
+                    self.profiles.remove(&v);
+                }
+            }
+
+            self.profiles.insert(
+                trimmed.to_string(),
+                TableProfile {
                     exec_count: 1,
                     ewma_log_scan_bytes: log_scan_bytes,
                     ewma_log_bytes_per_row: log_bytes_per_row,
                     ewma_mem_multiplier_log: mem_multiplier_log,
                     ewma_spill_rate: spill_val,
-                });
+                },
+            );
         }
     }
 
@@ -177,5 +204,28 @@ mod tests {
         assert_eq!(dense1, dense2);
         assert!((ratio1 - 1.0).abs() < 1e-6);
         assert_eq!(ratio1, ratio2);
+    }
+
+    #[test]
+    fn test_table_catalog_respects_max_capacity_and_evicts_least_frequent() {
+        let catalog = TableCatalog::with_capacity(2);
+        let t101 = ["0".to_string(), "0".to_string(), "101".to_string()];
+        let t202 = ["0".to_string(), "0".to_string(), "202".to_string()];
+        let t303 = ["0".to_string(), "0".to_string(), "303".to_string()];
+
+        for _ in 0..5 {
+            catalog.record_execution(&t101, 10_000_000, 100_000, 50_000_000, 14.0, false);
+        }
+        catalog.record_execution(&t202, 10_000_000, 100_000, 50_000_000, 14.0, false);
+        assert_eq!(catalog.len(), 2);
+
+        catalog.record_execution(&t303, 10_000_000, 100_000, 50_000_000, 14.0, false);
+        assert_eq!(catalog.len(), 2);
+
+        let exported = catalog.export_profiles();
+        let keys: Vec<&str> = exported.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"101"));
+        assert!(keys.contains(&"303"));
+        assert!(!keys.contains(&"202"));
     }
 }

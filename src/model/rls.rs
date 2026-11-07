@@ -1,6 +1,7 @@
 use crate::types::CanonicalPlanFeatures;
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex};
 
 const FORGETTING_FACTOR: f64 = 0.995;
 const WEIGHT_MIN: f64 = -50.0;
@@ -32,7 +33,8 @@ pub struct RlsPrediction {
 }
 
 pub struct OnlineRlsCalibrator {
-    state: RwLock<RlsState>,
+    state: ArcSwap<RlsState>,
+    write_lock: Mutex<()>,
 }
 
 fn extract_features(plan: &CanonicalPlanFeatures) -> [f64; 6] {
@@ -74,7 +76,7 @@ impl OnlineRlsCalibrator {
             row[i] = 10.0;
         }
         Self {
-            state: RwLock::new(RlsState {
+            state: ArcSwap::from_pointee(RlsState {
                 w_mem: [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
                 w_scan: [2.0, 0.5, 0.5, 0.0, 0.0, 0.0],
                 w_rows: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
@@ -83,12 +85,13 @@ impl OnlineRlsCalibrator {
                 ewma_resid_var_mem: 0.30,
                 update_count: 0,
             }),
+            write_lock: Mutex::new(()),
         }
     }
 
     pub fn predict(&self, plan: &CanonicalPlanFeatures) -> RlsPrediction {
         let x = extract_features(plan);
-        let state = self.state.read().unwrap();
+        let state = self.state.load();
 
         let log_mem_p50 = if x[1] == 0.0 && state.update_count == 0 {
             18.0
@@ -125,7 +128,8 @@ impl OnlineRlsCalibrator {
         let y_rows = (return_rows as f64).ln_1p();
         let y_cpu = (cpu_cost_ns as f64).ln_1p();
 
-        let mut state = self.state.write().unwrap();
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = (**self.state.load()).clone();
 
         // Compute P * x and x^T * P
         let mut px = [0.0; 6];
@@ -182,15 +186,17 @@ impl OnlineRlsCalibrator {
         }
 
         state.update_count = state.update_count.saturating_add(1);
+        self.state.store(Arc::new(state));
     }
 
     pub fn to_state(&self) -> RlsState {
-        self.state.read().unwrap().clone()
+        (**self.state.load()).clone()
     }
 
     pub fn from_state(state: RlsState) -> Self {
         Self {
-            state: RwLock::new(state),
+            state: ArcSwap::from_pointee(state),
+            write_lock: Mutex::new(()),
         }
     }
 }
@@ -264,5 +270,37 @@ mod tests {
         let pred1 = rls.predict(&zero_cbo_plan);
         let pred2 = restored.predict(&zero_cbo_plan);
         assert!((pred1.log_mem_p50 - pred2.log_mem_p50).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_rls_calibrator_concurrent_arcswap_reads_and_updates() {
+        let rls = Arc::new(OnlineRlsCalibrator::new());
+        let plan = Arc::new(make_test_plan(0x7777, 14.0, 18.0));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let rls_r = Arc::clone(&rls);
+            let plan_r = Arc::clone(&plan);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let pred = rls_r.predict(&plan_r);
+                    assert!(pred.log_mem_p50.is_finite());
+                    assert!(pred.log_mem_p90 >= pred.log_mem_p50);
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let rls_w = Arc::clone(&rls);
+            let plan_w = Arc::clone(&plan);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    rls_w.update(&plan_w, 64_000_000, 10_000_000, 1_000, 50_000_000);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(rls.to_state().update_count, 100);
     }
 }

@@ -29,26 +29,26 @@ pub fn parse_predict_csv(csv_body: &str) -> Result<CanonicalPlanFeatures, Decode
         first_line
     };
 
-    let cols: Vec<&str> = data_line.split(',').map(str::trim).collect();
-    if cols.len() < 7 {
-        return Err(DecodeError::InvalidCsvFormat(format!(
-            "expected at least 7 columns, got {}",
-            cols.len()
-        )));
+    let mut cols = data_line.split(',').map(str::trim);
+    let mut header = [""; 7];
+    for (i, slot) in header.iter_mut().enumerate() {
+        *slot = cols.next().ok_or_else(|| {
+            DecodeError::InvalidCsvFormat(format!("expected at least 7 columns, got {i}"))
+        })?;
     }
 
     let tables = [
-        cols[0].to_string(),
-        cols[1].to_string(),
-        cols[2].to_string(),
+        header[0].to_string(),
+        header[1].to_string(),
+        header[2].to_string(),
     ];
-    let num_be_nodes = cols[3].parse::<i64>()?.max(0) as u64;
-    let avg_cpu_cores = cols[4].parse::<i64>()?.max(0) as u64;
-    let env_mem_log = cols[5].parse::<i64>()?.max(0) as u64;
-    let pipeline_dop = cols[6].parse::<i64>()?.max(0) as u64;
+    let num_be_nodes = header[3].parse::<i64>()?.max(0) as u64;
+    let avg_cpu_cores = header[4].parse::<i64>()?.max(0) as u64;
+    let env_mem_log = header[5].parse::<i64>()?.max(0) as u64;
+    let pipeline_dop = header[6].parse::<i64>()?.max(0) as u64;
 
-    let mut ops = Vec::with_capacity(cols.len().saturating_sub(7));
-    for token in &cols[7..] {
+    let mut ops = Vec::with_capacity(64);
+    for token in cols {
         if !token.is_empty() {
             ops.push(token.parse::<i64>()?);
         }
