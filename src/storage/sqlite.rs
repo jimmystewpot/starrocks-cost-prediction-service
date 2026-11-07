@@ -4,6 +4,9 @@ use crate::types::{
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const MAX_RETAINED_SNAPSHOTS: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -18,6 +21,7 @@ pub enum StorageError {
 pub struct SqliteStore {
     conn: Mutex<Connection>,
     max_per_stratum: usize,
+    stratum_counts: [AtomicUsize; 5],
 }
 
 impl SqliteStore {
@@ -62,9 +66,28 @@ impl SqliteStore {
              );",
         )?;
 
+        let stratum_counts: [AtomicUsize; 5] = std::array::from_fn(|_| AtomicUsize::new(0));
+        {
+            let mut stmt = conn.prepare(
+                "SELECT mem_stratum, COUNT(*) FROM telemetry_samples GROUP BY mem_stratum",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let s: i64 = row.get(0)?;
+                let c: i64 = row.get(1)?;
+                Ok((s, c))
+            })?;
+            for r in rows {
+                let (s, c) = r?;
+                if (0..5).contains(&s) {
+                    stratum_counts[s as usize].store(c.max(0) as usize, Ordering::Relaxed);
+                }
+            }
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
             max_per_stratum: max_per_stratum.max(1),
+            stratum_counts,
         })
     }
 
@@ -78,10 +101,11 @@ impl SqliteStore {
         dense: &DenseFeatureVector,
         sample: &TelemetrySample,
     ) -> Result<(), StorageError> {
-        let stratum = memory_stratum(sample.effective_mem_bytes) as i64;
-        let mut features_blob = Vec::with_capacity(DENSE_FEATURE_DIM * 8);
-        for &val in dense.iter() {
-            features_blob.extend_from_slice(&val.to_le_bytes());
+        let stratum_idx = (memory_stratum(sample.effective_mem_bytes) as usize).min(4);
+        let stratum = stratum_idx as i64;
+        let mut features_blob = [0u8; DENSE_FEATURE_DIM * 8];
+        for (i, &val) in dense.iter().enumerate() {
+            features_blob[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
         }
 
         let log_mem = (1.0 + sample.effective_mem_bytes as f64).ln();
@@ -91,39 +115,42 @@ impl SqliteStore {
         let spilled = if sample.spilled_bytes > 0 { 1.0 } else { 0.0 };
 
         let conn = self.lock_conn();
-        conn.execute(
-            "INSERT INTO telemetry_samples (
-                plan_hash, mem_stratum, features_blob,
-                log_mem, log_scan_bytes, log_return_rows, log_cpu_ns, spilled, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut insert_stmt = tx.prepare_cached(
+                "INSERT INTO telemetry_samples (
+                    plan_hash, mem_stratum, features_blob,
+                    log_mem, log_scan_bytes, log_return_rows, log_cpu_ns, spilled, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            insert_stmt.execute(params![
                 plan_hash as i64,
                 stratum,
-                features_blob,
+                &features_blob[..],
                 log_mem,
                 log_scan_bytes,
                 log_return_rows,
                 log_cpu_ns,
                 spilled,
                 sample.timestamp_s as i64,
-            ],
-        )?;
+            ])?;
+        }
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM telemetry_samples WHERE mem_stratum = ?1",
-            params![stratum],
-            |row| row.get(0),
-        )?;
-
-        let excess = count - (self.max_per_stratum as i64);
-        if excess > 0 {
-            conn.execute(
+        let prev_count = self.stratum_counts[stratum_idx].load(Ordering::Relaxed);
+        let mut new_count = prev_count + 1;
+        if new_count > self.max_per_stratum {
+            let excess = (new_count - self.max_per_stratum) as i64;
+            let mut del_stmt = tx.prepare_cached(
                 "DELETE FROM telemetry_samples WHERE id IN (
                     SELECT id FROM telemetry_samples WHERE mem_stratum = ?1 ORDER BY id ASC LIMIT ?2
                  )",
-                params![stratum, excess],
             )?;
+            let deleted = del_stmt.execute(params![stratum, excess])?;
+            new_count = new_count.saturating_sub(deleted);
         }
+
+        tx.commit()?;
+        self.stratum_counts[stratum_idx].store(new_count, Ordering::Relaxed);
 
         Ok(())
     }
@@ -170,23 +197,9 @@ impl SqliteStore {
     }
 
     pub fn sample_counts_by_stratum(&self) -> Result<[usize; 5], StorageError> {
-        let conn = self.lock_conn();
-        let mut stmt = conn
-            .prepare("SELECT mem_stratum, COUNT(*) FROM telemetry_samples GROUP BY mem_stratum")?;
-        let rows = stmt.query_map([], |row| {
-            let s: i64 = row.get(0)?;
-            let c: i64 = row.get(1)?;
-            Ok((s, c))
-        })?;
-
-        let mut counts = [0usize; 5];
-        for r in rows {
-            let (s, c) = r?;
-            if (0..5).contains(&s) {
-                counts[s as usize] = c.max(0) as usize;
-            }
-        }
-        Ok(counts)
+        Ok(std::array::from_fn(|i| {
+            self.stratum_counts[i].load(Ordering::Relaxed)
+        }))
     }
 
     pub fn save_snapshot_blob(
@@ -196,11 +209,19 @@ impl SqliteStore {
         blob: &[u8],
     ) -> Result<(), StorageError> {
         let conn = self.lock_conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO model_snapshots (version, metrics_json, snapshot_blob)
              VALUES (?1, ?2, ?3)",
             params![version as i64, metrics_json, blob],
         )?;
+        tx.execute(
+            "DELETE FROM model_snapshots WHERE version NOT IN (
+                SELECT version FROM model_snapshots ORDER BY version DESC LIMIT ?1
+             )",
+            params![MAX_RETAINED_SNAPSHOTS as i64],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -224,6 +245,13 @@ impl SqliteStore {
             )
             .optional()?;
         Ok(res)
+    }
+
+    pub fn snapshot_count(&self) -> Result<usize, StorageError> {
+        let conn = self.lock_conn();
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM model_snapshots", [], |row| row.get(0))?;
+        Ok(count.max(0) as usize)
     }
 
     pub fn get_file_checkpoint(&self, path: &str) -> Result<Option<(u64, u64)>, StorageError> {
@@ -354,5 +382,38 @@ mod tests {
                 .unwrap(),
             Some((12345, 67890))
         );
+    }
+
+    #[test]
+    fn test_sqlite_snapshot_pruning_retains_latest_five() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::open(tmp.path(), 10).unwrap();
+        for v in 1..=8 {
+            store
+                .save_snapshot_blob(v, &format!(r#"{{"version":{v}}}"#), &[v as u8; 16])
+                .unwrap();
+        }
+        let (latest_ver, metrics, blob) = store.load_latest_snapshot_blob().unwrap().unwrap();
+        assert_eq!(latest_ver, 8);
+        assert_eq!(metrics, r#"{"version":8}"#);
+        assert_eq!(blob, vec![8u8; 16]);
+        assert_eq!(
+            store.snapshot_count().unwrap(),
+            5,
+            "model_snapshots must prune older snapshots and retain only the latest 5"
+        );
+
+        // Also verify sample_counts_by_stratum hydration across reopen
+        let line = "digest=d1|cpuCostNs=500000|memCostBytes=40000000|scanBytes=10000000|scanRows=50000|returnRows=100|spilledBytes=10000000|time=120|state=EOF|catalog=c|database=d|tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]";
+        let sample = parse_features_log_line(line).unwrap().unwrap();
+        let dense = [0.0_f64; 39];
+        store.insert_sample(1, &dense, &sample).unwrap();
+        store.insert_sample(2, &dense, &sample).unwrap();
+        let counts_before = store.sample_counts_by_stratum().unwrap();
+        drop(store);
+
+        let reopened = SqliteStore::open(tmp.path(), 10).unwrap();
+        assert_eq!(reopened.sample_counts_by_stratum().unwrap(), counts_before);
+        assert_eq!(reopened.snapshot_count().unwrap(), 5);
     }
 }
