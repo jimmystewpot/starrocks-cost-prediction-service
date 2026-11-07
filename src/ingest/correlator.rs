@@ -52,6 +52,10 @@ impl InFlightCache {
             } else {
                 drop(entry);
                 self.by_watermarked.remove(&event.predict_mem_bytes);
+                self.by_low10
+                    .remove_if(&(event.predict_mem_bytes & 0x3FF), |_, (wm, _, _)| {
+                        *wm == event.predict_mem_bytes
+                    });
             }
         }
 
@@ -66,7 +70,8 @@ impl InFlightCache {
                 } else {
                     let wm_key = *wm_key;
                     drop(entry);
-                    self.by_low10.remove(&low10);
+                    self.by_low10
+                        .remove_if(&low10, |_, (wm, _, _)| *wm == wm_key);
                     self.by_watermarked.remove(&wm_key);
                 }
             }
@@ -121,11 +126,13 @@ impl InFlightCache {
         if !expired_keys.is_empty() {
             for k in expired_keys {
                 self.by_watermarked.remove(&k);
-                self.by_low10.remove(&(k & 0x3FF));
+                self.by_low10
+                    .remove_if(&(k & 0x3FF), |_, (wm, _, _)| *wm == k);
             }
         } else if let Some((k, _)) = oldest_key {
             self.by_watermarked.remove(&k);
-            self.by_low10.remove(&(k & 0x3FF));
+            self.by_low10
+                .remove_if(&(k & 0x3FF), |_, (wm, _, _)| *wm == k);
         }
     }
 }
@@ -227,5 +234,54 @@ mod tests {
             .correlate_audit_event(&audit)
             .expect("low10 fallback must correlate");
         assert_eq!(sample.plan_features.plan_hash, plan3.plan_hash);
+    }
+
+    #[test]
+    fn test_inflight_cache_eviction_preserves_colliding_low10_entry() {
+        let cache = InFlightCache::new(2, 1800);
+        let plan1 = parse_feature_string(
+            "tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]",
+        )
+        .unwrap();
+        let plan2 = parse_feature_string(
+            "tables=[0,0,202]|env=[3,16,24]|var=[8]|operators=[39,1,15,100,16,15,0,12,2,1,1]",
+        )
+        .unwrap();
+        let plan3 = parse_feature_string(
+            "tables=[0,0,303]|env=[3,16,24]|var=[8]|operators=[39,1,16,100,16,16,0,12,2,1,1]",
+        )
+        .unwrap();
+
+        let shared_low10: u64 = 0x2AB;
+        let wm1 = (50_000_000 & !0x3FF) | shared_low10;
+        let wm2 = (60_000_000 & !0x3FF) | shared_low10;
+        let wm3 = (70_000_000 & !0x3FF) | ((shared_low10 + 1) & 0x3FF);
+
+        cache.record_prediction(wm1, plan1);
+        std::thread::sleep(Duration::from_millis(2));
+        cache.record_prediction(wm2, plan2.clone());
+        std::thread::sleep(Duration::from_millis(2));
+        // Recording wm3 evicts wm1 (the oldest entry). It must NOT evict wm2 from by_low10.
+        cache.record_prediction(wm3, plan3);
+        assert_eq!(cache.len(), 2);
+
+        let shifted_wm2 = (85_000_000 & !0x3FF) | shared_low10;
+        let audit = AuditLogEvent {
+            digest: "d2".to_string(),
+            predict_mem_bytes: shifted_wm2,
+            mem_cost_bytes: 60_000_000,
+            scan_bytes: 1000,
+            scan_rows: 10,
+            return_rows: 1,
+            cpu_cost_ns: 100,
+            spilled_bytes: 0,
+            query_time_ms: 10,
+            state: "EOF".to_string(),
+            tables: vec!["db.202".to_string()],
+        };
+        let sample = cache
+            .correlate_audit_event(&audit)
+            .expect("wm2 in by_low10 must survive eviction of colliding wm1");
+        assert_eq!(sample.plan_features.plan_hash, plan2.plan_hash);
     }
 }
