@@ -151,3 +151,44 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/metrics", get(admin::handle_metrics))
         .with_state(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_observe_latency_ns_populates_all_histogram_buckets() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let cfg = AppConfig {
+            db_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let state = AppState::new(cfg).unwrap();
+
+        let latencies = [5_000, 20_000, 40_000, 80_000, 200_000, 500_000, 2_000_000];
+        for lat in latencies {
+            state.observe_latency_ns(lat);
+        }
+
+        assert_eq!(state.predict_latency_bucket_10us.load(Ordering::Relaxed), 1);
+        assert_eq!(state.predict_latency_bucket_25us.load(Ordering::Relaxed), 2);
+        assert_eq!(state.predict_latency_bucket_50us.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            state.predict_latency_bucket_100us.load(Ordering::Relaxed),
+            4
+        );
+        assert_eq!(
+            state.predict_latency_bucket_250us.load(Ordering::Relaxed),
+            5
+        );
+        assert_eq!(
+            state.predict_latency_bucket_1000us.load(Ordering::Relaxed),
+            6
+        );
+        assert_eq!(state.predict_latency_count.load(Ordering::Relaxed), 7);
+        assert_eq!(
+            state.predict_latency_ns_sum.load(Ordering::Relaxed),
+            2_845_000
+        );
+    }
+}

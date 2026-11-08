@@ -389,3 +389,361 @@ async fn test_ingest_rate_limit_returns_429_when_semaphore_saturated() {
         .unwrap();
     assert_eq!(res_predict.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_predict_endpoints_handle_non_utf8_raw_formats_and_bad_requests() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let cfg = AppConfig {
+        db_path: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let state = Arc::new(AppState::new(cfg).unwrap());
+    let app = build_router(state.clone());
+
+    // 1. POST /predict_csv with invalid UTF-8 -> 200 OK with "67108864"
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/predict_csv")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(vec![0xFF, 0xFE, 0xFD]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap().trim();
+    assert_eq!(body_str, "67108864");
+
+    // 2. POST /v1/predict with invalid UTF-8 -> 400 Bad Request
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/predict")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(vec![0xFF, 0xFE, 0xFD]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 3. POST /v1/predict with JSON {"csv": "0,0,1001,3,16,24,8,39,1,15,100,18,16,0,12,3,2,2"} -> 200 OK
+    let json_req = serde_json::json!({
+        "csv": "0,0,1001,3,16,24,8,39,1,15,100,18,16,0,12,3,2,2"
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/predict")
+                .header("content-type", "application/json")
+                .body(Body::from(json_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let pred: PredictionOutput = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(pred.predicted_mem_bytes_p90 > 0);
+
+    // 4. POST /v1/predict with raw pipe string -> 200 OK
+    let raw_pipe =
+        "tables=[0,0,1001]|env=[3,16,24]|var=[8]|operators=[39,1,15,100,18,16,0,12,3,2,2]";
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/predict")
+                .header("content-type", "text/plain")
+                .body(Body::from(raw_pipe))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let pred: PredictionOutput = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(pred.predicted_mem_bytes_p90 > 0);
+
+    // 5. POST /v1/predict with raw CSV string -> 200 OK
+    let raw_csv = "0,0,1001,3,16,24,8,39,1,15,100,18,16,0,12,3,2,2";
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/predict")
+                .header("content-type", "text/csv")
+                .body(Body::from(raw_csv))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let pred: PredictionOutput = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(pred.predicted_mem_bytes_p90 > 0);
+
+    // 6. POST /v1/predict with empty body "", invalid JSON "{bad", empty JSON "{}",
+    // and invalid feature string {"feature_string": "corrupt"} -> all return 400 Bad Request
+    let bad_payloads = ["", "{bad", "{}", r#"{"feature_string": "corrupt"}"#];
+    for payload in bad_payloads {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/predict")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for payload: {payload}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_ingest_endpoints_envelopes_empty_bodies_and_rate_limits() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let cfg = AppConfig {
+        db_path: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let state = Arc::new(AppState::new(cfg).unwrap());
+    let app = build_router(state.clone());
+
+    // 1. POST /v1/ingest/features with empty body "" -> 200 OK (ingested: 0, errors: 0)
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/features")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ingested"], 0);
+    assert_eq!(json["errors"], 0);
+
+    // 2. POST /v1/ingest/features with {"lines": ["...", "", "corrupt_line"]} -> 200 OK (ingested: 1, errors: 1)
+    let features_env = serde_json::json!({
+        "lines": [
+            "digest=d1|cpuCostNs=100|memCostBytes=2000000|scanBytes=100|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=EOF|tables=[0,0,1]|env=[1,8,24]|var=[1]|operators=[39,1,10,10,10,10,0,10,1,1,1]",
+            "",
+            "corrupt_line"
+        ]
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/features")
+                .header("content-type", "application/json")
+                .body(Body::from(features_env.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ingested"], 1);
+    assert_eq!(json["errors"], 1);
+
+    // 3. POST /v1/ingest/audit with empty body "" -> 200 OK (correlated: 0, unmatched: 0)
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/audit")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["correlated"], 0);
+    assert_eq!(json["unmatched"], 0);
+
+    // 4. POST /v1/ingest/audit with:
+    //    - AuditIngestPayload::Batch ([...])
+    let batch_payload = serde_json::json!([
+        { "digest": "batch_event_1" }
+    ]);
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/audit")
+                .header("content-type", "application/json")
+                .body(Body::from(batch_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["correlated"], 0);
+    assert_eq!(json["unmatched"], 1);
+
+    //    - AuditIngestPayload::Envelope ({"events": [...]})
+    let envelope_payload = serde_json::json!({
+        "events": [
+            { "digest": "envelope_event_1" }
+        ]
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/audit")
+                .header("content-type", "application/json")
+                .body(Body::from(envelope_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["correlated"], 0);
+    assert_eq!(json["unmatched"], 1);
+
+    //    - multi-line JSONL fallback, including unmatched events (unmatched: 1)
+    let jsonl_payload = "{\"digest\": \"jsonl_event_1\"}\ncorrupt_line\n";
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/audit")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(jsonl_payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["correlated"], 0);
+    assert_eq!(json["unmatched"], 1);
+
+    // 5. POST /v1/ingest/profile with ProfileEnvelope -> 200 OK and increments ingested_samples
+    let samples_before = state.engine.status().ingested_samples;
+    let profile_env = serde_json::json!({
+        "digest": "p1",
+        "profile": "Query:\n  - PeakMemoryUsage: 64.00 MB\n  - BytesRead: 16.00 MB\n  - RowsRead: 1000\n",
+        "feature_string": "tables=[0,0,1001]|env=[3,16,24]|var=[8]|operators=[39,1,15,100,18,16,0,12,3,2,2]"
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/profile")
+                .header("content-type", "application/json")
+                .body(Body::from(profile_env.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(state.engine.status().ingested_samples, samples_before + 1);
+
+    // 6. POST /v1/ingest/profile with empty/unparseable profile "" -> 400 Bad Request
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/profile")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/profile")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"profile": ""}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 7. Hold all 4 state.ingest_semaphore permits and verify both
+    //    POST /v1/ingest/audit and POST /v1/ingest/profile return 429 Too Many Requests with retry-after: 1
+    let _permits = state
+        .ingest_semaphore
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap();
+
+    let res_audit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/audit")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"digest":"d"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_audit.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(res_audit.headers().get("retry-after").unwrap(), "1");
+
+    let res_profile = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/profile")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"profile":"Query:\n  - PeakMemoryUsage: 1MB\n"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_profile.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(res_profile.headers().get("retry-after").unwrap(), "1");
+}
