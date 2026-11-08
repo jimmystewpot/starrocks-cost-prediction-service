@@ -2,6 +2,24 @@ pub use crate::types::GbdtTrainingRow;
 use crate::types::{DENSE_FEATURE_DIM, DenseFeatureVector};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+pub fn trainer_thread_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 4))
+        .unwrap_or(2)
+}
+
+fn trainer_thread_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(trainer_thread_pool_size())
+            .thread_name(|idx| format!("sr-gbdt-trainer-{idx}"))
+            .build()
+            .expect("failed to build GBDT Rayon thread pool")
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum LossType {
@@ -326,10 +344,12 @@ impl GbdtModelSet {
             (&spilled, LossType::Huber { delta: 0.5 }),
         ];
 
-        let mut models: Vec<BoostedTreeRegressor> = specs
-            .into_par_iter()
-            .map(|(targets, loss)| BoostedTreeRegressor::train(&features, targets, loss, params))
-            .collect();
+        let mut models: Vec<BoostedTreeRegressor> = trainer_thread_pool().install(|| {
+            specs
+                .into_par_iter()
+                .map(|(targets, loss)| BoostedTreeRegressor::train(&features, targets, loss, params))
+                .collect()
+        });
 
         let spill_prob = models.pop().expect("spill_prob model");
         let cpu_ns_p50 = models.pop().expect("cpu_ns_p50 model");
@@ -453,5 +473,19 @@ mod tests {
         let over_loss = pinball_loss(20.0, 22.0, 0.90); // overprediction by 2.0 -> 0.2
         assert!((under_loss - 1.8).abs() < 1e-12);
         assert!((over_loss - 0.2).abs() < 1e-12);
+
+        // Verify isolated Rayon trainer thread pool bounds and thread naming
+        let pool_size = trainer_thread_pool_size();
+        assert!((1..=4).contains(&pool_size));
+        let thread_name = trainer_thread_pool().install(|| {
+            std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert!(
+            thread_name.starts_with("sr-gbdt-trainer-"),
+            "unexpected thread name: {thread_name}"
+        );
     }
 }

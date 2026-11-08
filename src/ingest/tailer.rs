@@ -2,10 +2,18 @@ use crate::ingest::parser::parse_features_log_line;
 use crate::storage::sqlite::SqliteStore;
 use crate::types::TelemetrySample;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub const MAX_LINES_PER_POLL: usize = 5_000;
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+pub struct TailBatch {
+    pub samples: Vec<TelemetrySample>,
+    pub inode: u64,
+    pub new_offset: u64,
+}
 
 pub struct FileTailer;
 
@@ -22,6 +30,27 @@ impl FileTailer {
         store: &SqliteStore,
         max_lines: usize,
     ) -> Result<Vec<TelemetrySample>, std::io::Error> {
+        let Some(batch) = Self::read_batch_with_limit(log_path, store, max_lines)? else {
+            return Ok(Vec::new());
+        };
+        Self::commit_batch(log_path, store, &batch)?;
+        Ok(batch.samples)
+    }
+
+    pub fn read_batch_with_limit(
+        log_path: &Path,
+        store: &SqliteStore,
+        max_lines: usize,
+    ) -> Result<Option<TailBatch>, std::io::Error> {
+        Self::read_batch_with_limits(log_path, store, max_lines, MAX_LINE_BYTES)
+    }
+
+    pub fn read_batch_with_limits(
+        log_path: &Path,
+        store: &SqliteStore,
+        max_lines: usize,
+        max_line_bytes: usize,
+    ) -> Result<Option<TailBatch>, std::io::Error> {
         let mut file = File::open(log_path)?;
         let meta = file.metadata()?;
         let current_inode = file_inode(&meta);
@@ -47,7 +76,7 @@ impl FileTailer {
                     .set_file_checkpoint(&path_key, current_inode, offset)
                     .map_err(std::io::Error::other)?;
             }
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         file.seek(SeekFrom::Start(offset))?;
@@ -55,13 +84,44 @@ impl FileTailer {
         let mut line_buf = Vec::new();
         let mut samples = Vec::new();
         let line_limit = max_lines.max(1);
+        let byte_limit = max_line_bytes.max(64);
         let mut lines_processed = 0usize;
 
         while lines_processed < line_limit {
             line_buf.clear();
-            let bytes_read = reader.read_until(b'\n', &mut line_buf)?;
+            let bytes_read = (&mut reader)
+                .take((byte_limit + 1) as u64)
+                .read_until(b'\n', &mut line_buf)?;
             if bytes_read == 0 {
                 break;
+            }
+            if bytes_read > byte_limit && !line_buf.ends_with(b"\n") {
+                let mut discard = Vec::new();
+                let mut skipped = bytes_read as u64;
+                let mut hit_newline = false;
+                loop {
+                    discard.clear();
+                    let n = (&mut reader).take(65_536).read_until(b'\n', &mut discard)?;
+                    if n == 0 {
+                        break;
+                    }
+                    skipped += n as u64;
+                    if discard.ends_with(b"\n") {
+                        hit_newline = true;
+                        break;
+                    }
+                }
+                if !hit_newline {
+                    break;
+                }
+                offset += skipped;
+                lines_processed += 1;
+                tracing::warn!(
+                    path = %path_key,
+                    skipped_bytes = skipped,
+                    "skipping oversized features log line"
+                );
+                continue;
             }
             if !line_buf.ends_with(b"\n") {
                 // Partial trailing line; do not advance checkpoint until newline arrives.
@@ -84,11 +144,22 @@ impl FileTailer {
             }
         }
 
-        store
-            .set_file_checkpoint(&path_key, current_inode, offset)
-            .map_err(std::io::Error::other)?;
+        Ok(Some(TailBatch {
+            samples,
+            inode: current_inode,
+            new_offset: offset,
+        }))
+    }
 
-        Ok(samples)
+    pub fn commit_batch(
+        log_path: &Path,
+        store: &SqliteStore,
+        batch: &TailBatch,
+    ) -> Result<(), std::io::Error> {
+        let path_key = log_path.to_string_lossy();
+        store
+            .set_file_checkpoint(&path_key, batch.inode, batch.new_offset)
+            .map_err(std::io::Error::other)
     }
 }
 
@@ -189,5 +260,44 @@ mod tests {
 
         let poll4 = FileTailer::poll_once_with_limit(&log_path, &store, 2).unwrap();
         assert!(poll4.is_empty());
+    }
+
+    #[test]
+    fn test_file_tailer_skips_oversized_corrupt_line_and_commits_checkpoint_only_on_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_oversized.db");
+        let log_path = dir.path().join("fe.features.log");
+        let store = SqliteStore::open(&db_path, 100).unwrap();
+
+        let line1 = "digest=d1|cpuCostNs=100|memCostBytes=10000000|scanBytes=1000|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=EOF|catalog=c|database=d|tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]\n";
+        let oversized = format!("digest=corrupt|{}\n", "X".repeat(2000));
+        let line2 = "digest=d2|cpuCostNs=100|memCostBytes=10000000|scanBytes=1000|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=EOF|catalog=c|database=d|tables=[0,0,102]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]\n";
+
+        std::fs::write(&log_path, format!("{line1}{oversized}{line2}")).unwrap();
+
+        let batch = FileTailer::read_batch_with_limits(&log_path, &store, 10, 512)
+            .unwrap()
+            .expect("should read batch");
+        assert_eq!(batch.samples.len(), 2);
+        assert_eq!(batch.samples[0].digest, "d1");
+        assert_eq!(batch.samples[1].digest, "d2");
+
+        // Checkpoint must NOT be saved before commit_batch is called
+        assert!(
+            store
+                .get_file_checkpoint(&log_path.to_string_lossy())
+                .unwrap()
+                .is_none()
+        );
+
+        FileTailer::commit_batch(&log_path, &store, &batch).unwrap();
+        assert_eq!(
+            store
+                .get_file_checkpoint(&log_path.to_string_lossy())
+                .unwrap()
+                .unwrap()
+                .1,
+            batch.new_offset
+        );
     }
 }

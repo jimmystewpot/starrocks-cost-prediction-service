@@ -136,7 +136,9 @@ impl PlanSketchCache {
                 ewma_ref_scan_log_rows: scan_log_rows,
             });
 
-        self.evict_if_needed(Some(plan.plan_hash));
+        if self.map.len() > self.max_entries {
+            self.evict_if_needed(Some(plan.plan_hash));
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -168,11 +170,13 @@ impl PlanSketchCache {
                 .map
                 .iter()
                 .filter(|r| Some(*r.key()) != exclude_key)
+                .take(64)
                 .min_by_key(|r| (r.value().hit_count, r.value().last_seen_epoch_s, *r.key()))
                 .map(|r| *r.key())
                 .or_else(|| {
                     self.map
                         .iter()
+                        .take(64)
                         .min_by_key(|r| {
                             (r.value().hit_count, r.value().last_seen_epoch_s, *r.key())
                         })
