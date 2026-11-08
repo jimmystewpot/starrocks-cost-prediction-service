@@ -45,6 +45,7 @@ private final CloseableHttpClient httpClient = HttpClients.createDefault();
 ```
 src/
 ├── config.rs           # Configuration parser for environment variables with fallback defaults
+├── runtime.rs          # Testable daemon runtime (TCP_NODELAY listener, background trainer/tailer, graceful shutdown)
 ├── types.rs            # Core domain types, DenseFeatureVector (39), watermark & penalty formulas
 ├── lib.rs              # Crate library root and module exports
 ├── main.rs             # Daemon entrypoint, signal handling, server startup
