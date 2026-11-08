@@ -347,7 +347,9 @@ impl GbdtModelSet {
         let mut models: Vec<BoostedTreeRegressor> = trainer_thread_pool().install(|| {
             specs
                 .into_par_iter()
-                .map(|(targets, loss)| BoostedTreeRegressor::train(&features, targets, loss, params))
+                .map(|(targets, loss)| {
+                    BoostedTreeRegressor::train(&features, targets, loss, params)
+                })
                 .collect()
         });
 

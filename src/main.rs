@@ -1,7 +1,7 @@
 use starrocks_cost_prediction_service::{
     api::{AppState, build_router},
     config::AppConfig,
-    ingest::tailer::FileTailer,
+    ingest::tailer::{FileTailer, MAX_LINES_PER_POLL},
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -100,23 +100,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !poll_path.exists() {
                         return Ok(());
                     }
-                    let samples = FileTailer::poll_once(&poll_path, &poll_state.store)?;
-                    if !samples.is_empty() {
-                        let count = samples.len() as u64;
-                        let mut should_retrain = false;
-                        for sample in &samples {
-                            if let Ok(trigger) = poll_state.engine.observe_execution(sample)
-                                && trigger
-                            {
-                                should_retrain = true;
+                    if let Some(batch) = FileTailer::read_batch_with_limit(
+                        &poll_path,
+                        &poll_state.store,
+                        MAX_LINES_PER_POLL,
+                    )? {
+                        if !batch.samples.is_empty() {
+                            let count = batch.samples.len() as u64;
+                            let should_retrain = poll_state
+                                .engine
+                                .observe_executions_batch(&batch.samples)
+                                .map_err(std::io::Error::other)?;
+                            poll_state
+                                .ingest_features_total
+                                .fetch_add(count, Ordering::Relaxed);
+                            if should_retrain {
+                                poll_state.retrain_notify.notify_one();
                             }
                         }
-                        poll_state
-                            .ingest_features_total
-                            .fetch_add(count, Ordering::Relaxed);
-                        if should_retrain {
-                            poll_state.retrain_notify.notify_one();
-                        }
+                        FileTailer::commit_batch(&poll_path, &poll_state.store, &batch)?;
                     }
                     Ok::<(), std::io::Error>(())
                 })

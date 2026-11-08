@@ -75,7 +75,10 @@ src/
 │   └── mod.rs          # Holdout split, P90 Pinball & Q-Error evaluation, champion/challenger gate
 │
 └── api/                # Axum HTTP routes & handlers
-    └── mod.rs          # Router construction, /predict_csv, /v1/*, /health_check, /metrics handlers
+    ├── mod.rs          # AppState, ingestion concurrency semaphore, and router construction
+    ├── predict.rs      # Hot-path /predict_csv and /v1/predict handlers
+    ├── ingest.rs       # Rate-limited, batched /v1/ingest/{features,audit,profile} handlers
+    └── admin.rs        # /health_check, /v1/models/status, /v1/admin/*, and /metrics handlers
 ```
 
 ---

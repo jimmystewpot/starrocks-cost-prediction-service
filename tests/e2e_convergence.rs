@@ -340,3 +340,52 @@ async fn test_predict_csv_oversized_payload_returns_200_fallback_not_413() {
         .unwrap();
     assert_eq!(res_v1.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[tokio::test]
+async fn test_ingest_rate_limit_returns_429_when_semaphore_saturated() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let cfg = AppConfig {
+        db_path: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let state = Arc::new(AppState::new(cfg).unwrap());
+    let app = build_router(state.clone());
+
+    // Exhaust all 4 ingestion permits to simulate 4 concurrent heavy ingestion batches in flight
+    let _permits = state
+        .ingest_semaphore
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap();
+
+    // 5th concurrent ingestion request must immediately return 429 Too Many Requests with Retry-After: 1
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/features")
+                .header("content-type", "text/plain")
+                .body(Body::from("digest=d1|cpuCostNs=100|memCostBytes=2000000|scanBytes=100|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=EOF|tables=[0,0,1]|env=[1,8,24]|var=[1]|operators=[39,1,10,10,10,10,0,10,1,1,1]\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(res.headers().get("retry-after").unwrap(), "1");
+
+    // Meanwhile, hot-path POST /predict_csv remains completely unaffected and responds 200 OK
+    let csv = "tables_0,tables_1,tables_2,env_0,env_1,env_2,var_0,operators_0,operators_1,operators_2,operators_3,operators_4,operators_5,operators_6,operators_7,operators_8,operators_9,operators_10\n0,0,1001,3,16,24,8,39,1,15,100,18,16,0,12,3,2,2";
+    let res_predict = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/predict_csv")
+                .body(Body::from(csv))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_predict.status(), StatusCode::OK);
+}
