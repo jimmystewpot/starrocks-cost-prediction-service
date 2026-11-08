@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_rls_calibrator_cold_start_and_collinear_stability() {
-        let rls = OnlineRlsCalibrator::new();
+        let rls = OnlineRlsCalibrator::default();
         let plan = make_test_plan(0xABCD_1234, 14.0, 18.0);
         let cold = rls.predict(&plan);
         assert!(cold.log_mem_p50.is_finite());

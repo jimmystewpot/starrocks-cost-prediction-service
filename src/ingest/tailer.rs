@@ -299,5 +299,27 @@ mod tests {
                 .1,
             batch.new_offset
         );
+
+        // Verify empty file checkpoint initialization, non-finalized line (Ok(None)), malformed line (Err), and oversized line without newline
+        let empty_log = dir.path().join("empty.features.log");
+        std::fs::write(&empty_log, "").unwrap();
+        assert!(
+            FileTailer::read_batch_with_limits(&empty_log, &store, 10, 512)
+                .unwrap()
+                .is_none()
+        );
+
+        let running_line = "digest=d_run|cpuCostNs=100|memCostBytes=10000000|scanBytes=1000|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=RUNNING|catalog=c|database=d|tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]\n";
+        let malformed_line = "digest=d_bad|state=EOF|memCostBytes=1000|tables=[1]|env=[1]\n";
+        let oversized_no_newline = format!("digest=partial|{}", "Y".repeat(1200));
+        std::fs::write(
+            &empty_log,
+            format!("{running_line}{malformed_line}{oversized_no_newline}"),
+        )
+        .unwrap();
+        let batch2 = FileTailer::read_batch_with_limits(&empty_log, &store, 10, 512)
+            .unwrap()
+            .expect("should read batch with skipped lines");
+        assert!(batch2.samples.is_empty());
     }
 }

@@ -522,6 +522,7 @@ async fn test_ingest_endpoints_envelopes_empty_bodies_and_rate_limits() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let cfg = AppConfig {
         db_path: tmp.path().to_path_buf(),
+        min_new_samples_for_retrain: 1,
         ..Default::default()
     };
     let state = Arc::new(AppState::new(cfg).unwrap());
@@ -545,10 +546,11 @@ async fn test_ingest_endpoints_envelopes_empty_bodies_and_rate_limits() {
     assert_eq!(json["ingested"], 0);
     assert_eq!(json["errors"], 0);
 
-    // 2. POST /v1/ingest/features with {"lines": ["...", "", "corrupt_line"]} -> 200 OK (ingested: 1, errors: 1)
+    // 2. POST /v1/ingest/features with {"lines": ["...", "state=RUNNING...", "", "corrupt_line"]} -> 200 OK (ingested: 1, errors: 1)
     let features_env = serde_json::json!({
         "lines": [
             "digest=d1|cpuCostNs=100|memCostBytes=2000000|scanBytes=100|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=EOF|tables=[0,0,1]|env=[1,8,24]|var=[1]|operators=[39,1,10,10,10,10,0,10,1,1,1]",
+            "digest=d_run|cpuCostNs=100|memCostBytes=2000000|scanBytes=100|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=RUNNING|tables=[0,0,1]|env=[1,8,24]|var=[1]|operators=[39,1,10,10,10,10,0,10,1,1,1]",
             "",
             "corrupt_line"
         ]
@@ -570,6 +572,22 @@ async fn test_ingest_endpoints_envelopes_empty_bodies_and_rate_limits() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["ingested"], 1);
     assert_eq!(json["errors"], 1);
+
+    // 2b. POST /v1/ingest/features with plain-text multi-line body including empty & corrupt lines
+    let plain_features = "digest=d2|cpuCostNs=100|memCostBytes=2000000|scanBytes=100|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=EOF|tables=[0,0,1]|env=[1,8,24]|var=[1]|operators=[39,1,10,10,10,10,0,10,1,1,1]\n\ncorrupt_line\n";
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest/features")
+                .header("content-type", "text/plain")
+                .body(Body::from(plain_features))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 
     // 3. POST /v1/ingest/audit with empty body "" -> 200 OK (correlated: 0, unmatched: 0)
     let res = app
@@ -656,10 +674,9 @@ async fn test_ingest_endpoints_envelopes_empty_bodies_and_rate_limits() {
     assert_eq!(json["correlated"], 0);
     assert_eq!(json["unmatched"], 1);
 
-    // 5. POST /v1/ingest/profile with ProfileEnvelope -> 200 OK and increments ingested_samples
+    // 5. POST /v1/ingest/profile with ProfileEnvelope (without digest) -> 200 OK and increments ingested_samples
     let samples_before = state.engine.status().ingested_samples;
     let profile_env = serde_json::json!({
-        "digest": "p1",
         "profile": "Query:\n  - PeakMemoryUsage: 64.00 MB\n  - BytesRead: 16.00 MB\n  - RowsRead: 1000\n",
         "feature_string": "tables=[0,0,1001]|env=[3,16,24]|var=[8]|operators=[39,1,15,100,18,16,0,12,3,2,2]"
     });

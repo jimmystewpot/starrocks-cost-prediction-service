@@ -1,4 +1,5 @@
 use crate::api::{AppState, build_router};
+use crate::config::AppConfig;
 use crate::ingest::tailer::{FileTailer, MAX_LINES_PER_POLL};
 use crate::model::ensemble::RetrainReport;
 use crate::storage::sqlite::StorageError;
@@ -163,6 +164,24 @@ where
     res
 }
 
+pub async fn run_with_config<F>(
+    config: AppConfig,
+    shutdown_signal: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let bind_addr = config.bind_addr.clone();
+    let state = Arc::new(AppState::new(config)?);
+    let tcp_listener = TcpListener::bind(&bind_addr).await?;
+    tracing::info!(
+        bind_addr = %bind_addr,
+        "StarRocks Cost Prediction Service listening with TCP_NODELAY enabled"
+    );
+    serve_with_shutdown(tcp_listener, state, shutdown_signal).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +237,14 @@ mod tests {
 
         let saved_blob = state.store.load_latest_snapshot_blob().unwrap();
         assert!(saved_blob.is_some());
+
+        // Also exercise run_with_config on an ephemeral port
+        let cfg2 = AppConfig {
+            bind_addr: "127.0.0.1:0".to_string(),
+            db_path: dir.path().join("runtime_cfg2.db"),
+            ..AppConfig::default()
+        };
+        run_with_config(cfg2, async {}).await.unwrap();
     }
 
     #[tokio::test]

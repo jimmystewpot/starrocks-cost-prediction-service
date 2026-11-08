@@ -798,5 +798,14 @@ mod tests {
         let report_rejected = engine.retrain_and_promote().unwrap();
         assert!(!report_rejected.promoted);
         assert_eq!(report_rejected.model_version, 1);
+
+        // 5. Verify log_to_u64 edge cases and drift-triggered observe_executions_batch(&[])
+        assert_eq!(log_to_u64(0.0), 0);
+        assert_eq!(log_to_u64(-5.0), 0);
+        assert_eq!(log_to_u64(f64::NAN), 0);
+        engine
+            .live_q_error_ewma_bits
+            .store((10.0_f64).to_bits(), Ordering::Relaxed);
+        assert!(engine.observe_executions_batch(&[]).unwrap());
     }
 }

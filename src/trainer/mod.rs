@@ -131,5 +131,13 @@ mod tests {
         };
         assert!(should_promote_challenger(Some(&champ), &slightly_worse));
         assert!(!should_promote_challenger(Some(&champ), &much_worse));
+
+        // Edge cases: < 5 rows in split, empty validation rows, 0 validation samples in gate
+        let (short_train, short_val) = split_train_validation(&rows[..3]);
+        assert_eq!(short_train.len(), 3);
+        assert_eq!(short_val.len(), 3);
+        let empty_eval = evaluate_model_set(&_models, &[]);
+        assert_eq!(empty_eval.validation_samples, 0);
+        assert!(!should_promote_challenger(None, &empty_eval));
     }
 }

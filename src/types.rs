@@ -191,6 +191,29 @@ mod tests {
         let watermarked = watermark_mem_bytes(raw_bytes, plan_hash, 1_048_576);
         assert_eq!(watermarked & 0x3FF, 0x2A5);
         assert!((watermarked as i64 - raw_bytes as i64).abs() < 1024);
+
+        // Sub-1MiB allocation bypasses watermark
+        assert_eq!(watermark_mem_bytes(512_000, plan_hash, 256_000), 512_000);
+
+        // PredictionOutput deserialization covers fallback and custom dominant_tier
+        for tier in ["fallback", "custom_tier"] {
+            let out = PredictionOutput {
+                predicted_mem_bytes_p90: 1024,
+                predicted_mem_bytes_p50: 512,
+                predicted_scan_bytes: 100,
+                predicted_return_rows: 10,
+                predicted_cpu_cost_ns: 1000,
+                spill_probability: 0.0,
+                confidence: 0.5,
+                tier_weights: [0.0, 0.0, 1.0],
+                dominant_tier: tier,
+                model_version: 0,
+                latency_us: 5,
+            };
+            let json = serde_json::to_string(&out).unwrap();
+            let decoded: PredictionOutput = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.dominant_tier, tier);
+        }
     }
 
     #[test]

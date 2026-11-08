@@ -512,5 +512,17 @@ mod tests {
 
         let res = store.load_training_rows();
         assert!(matches!(res, Err(StorageError::Serialization(_))));
+
+        // 3. Test legacy MessagePack Vec<f64> decoding (both valid 39-len and invalid len)
+        let valid_msgpack = rmp_serde::to_vec(&vec![2.5_f64; DENSE_FEATURE_DIM]).unwrap();
+        let decoded = decode_dense_features(&valid_msgpack).unwrap();
+        assert_eq!(decoded[0], 2.5);
+        assert_eq!(decoded[DENSE_FEATURE_DIM - 1], 2.5);
+
+        let wrong_len_msgpack = rmp_serde::to_vec(&vec![1.0_f64; 5]).unwrap();
+        assert!(matches!(
+            decode_dense_features(&wrong_len_msgpack),
+            Err(StorageError::Serialization(_))
+        ));
     }
 }

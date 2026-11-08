@@ -182,9 +182,10 @@ mod tests {
 
     #[test]
     fn test_export_and_import_profiles_preserves_catalog_state() {
-        let catalog1 = TableCatalog::new();
+        let catalog1 = TableCatalog::default();
         assert!(catalog1.is_empty());
         let tables = ["0".to_string(), "1001".to_string(), "2002".to_string()];
+        catalog1.record_execution(&tables, 20_000_000, 0, 80_000_000, 0.0, false);
         for _ in 0..6 {
             catalog1.record_execution(&tables, 20_000_000, 100_000, 80_000_000, 15.0, true);
         }

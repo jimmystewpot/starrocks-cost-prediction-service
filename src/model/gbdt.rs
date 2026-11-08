@@ -489,5 +489,16 @@ mod tests {
             thread_name.starts_with("sr-gbdt-trainer-"),
             "unexpected thread name: {thread_name}"
         );
+
+        // Edge cases: empty training set, empty slice helpers
+        let empty_reg =
+            BoostedTreeRegressor::train(&[], &[], LossType::Huber { delta: 1.0 }, &params);
+        assert_eq!(empty_reg.predict(&x), 0.0);
+        assert_eq!(compute_quantile(&[], 0.5), 0.0);
+        assert_eq!(
+            compute_leaf_value(&[], &[], LossType::Huber { delta: 1.0 }),
+            0.0
+        );
+        assert_eq!(predict_single_tree(&[], &x), 0.0);
     }
 }

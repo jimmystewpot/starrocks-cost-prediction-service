@@ -324,5 +324,15 @@ Query:
         );
         assert_eq!(summary.spilled_bytes, 512 * 1024);
         assert_eq!(summary.scan_bytes, 4096);
+
+        // 5. parse_query_profile with non-numeric values and TB unit
+        let profile_tb = "\
+Query:
+  - PeakMemoryUsage: N/A
+  - SpilledBytes: 1 TB
+";
+        let summary_tb = parse_query_profile(profile_tb).unwrap();
+        assert_eq!(summary_tb.peak_mem_bytes, 0);
+        assert_eq!(summary_tb.spilled_bytes, 1024 * 1024 * 1024 * 1024);
     }
 }

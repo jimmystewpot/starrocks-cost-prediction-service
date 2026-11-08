@@ -686,6 +686,19 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].kind, OperatorSegmentKind::HashAgg);
         assert_eq!(segments[1].kind, OperatorSegmentKind::Scan);
+
+        // Full plan exercising Exchange (8), HashAgg (11), HashJoin (10), Generic (7), and Scan (11) in canonical extraction
+        let full_pipe = "tables=[0,101]|env=[3,16,24]|var=[8]|operators=[34,1,10,50,12,10,0,5,35,1,10,50,12,10,0,10,2,1,5,36,1,10,100,14,12,0,12,1,0,38,1,5,10,8,6,0,39,1,15,100,18,16,0,12,3,2,2]";
+        let full_plan = parse_feature_string(full_pipe).expect("full plan should decode");
+        assert_eq!(full_plan.segments.len(), 5);
+        assert!(full_plan.plan_features_24[18] > 0.0); // Exchange present
+        assert!(full_plan.plan_features_24[19] > 0.0); // Generic present
+
+        // Backtracking in walk_segments when first candidate len=7 leads to dead end at pos=7
+        assert!(matches!(
+            decode_operator_segments(&[30, 1, 1, 1, 1, 1, 1, 31, 1, -1, 1, 1, 1, 1]),
+            Err(DecodeError::InvalidOperatorSegments(_))
+        ));
     }
 
     #[test]
