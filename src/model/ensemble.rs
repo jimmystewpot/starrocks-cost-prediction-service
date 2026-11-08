@@ -269,47 +269,75 @@ impl EnsembleEngine {
     }
 
     pub fn observe_execution(&self, sample: &TelemetrySample) -> Result<bool, StorageError> {
-        // 1. Evaluate current prediction error for live drift detector before updating models
-        let pre_pred = self.predict(&sample.plan_features, true);
-        let log_pred = (1.0 + pre_pred.predicted_mem_bytes_p90 as f64).ln();
-        let log_actual = (1.0 + sample.effective_mem_bytes as f64).ln();
-        let log_q_err = (log_pred - log_actual).abs().clamp(0.0, 10.0);
-        self.update_q_error_ewma(log_q_err);
+        self.observe_executions_batch(std::slice::from_ref(sample))
+    }
 
-        // 2. Update TableCatalog, Tier 1 Sketch, and Tier 3 RLS Calibrator
-        let spilled = sample.spilled_bytes > 0;
-        let cbo_mem_log = sample.plan_features.plan_features_24[21];
-        self.catalog.record_execution(
-            &sample.plan_features.tables,
-            sample.scan_bytes,
-            sample.scan_rows,
-            sample.effective_mem_bytes,
-            cbo_mem_log,
-            spilled,
-        );
-        self.sketch.update(
-            &sample.plan_features,
-            sample.effective_mem_bytes,
-            sample.scan_bytes,
-            sample.return_rows,
-            sample.cpu_cost_ns,
-            spilled,
-        );
-        self.rls.update(
-            &sample.plan_features,
-            sample.effective_mem_bytes,
-            sample.scan_bytes,
-            sample.return_rows,
-            sample.cpu_cost_ns,
-        );
+    pub fn observe_executions_batch(
+        &self,
+        samples: &[TelemetrySample],
+    ) -> Result<bool, StorageError> {
+        if samples.is_empty() {
+            let total_ingested = self.ingested_samples.load(Ordering::Relaxed);
+            let since_retrain = self.samples_since_retrain.load(Ordering::Relaxed);
+            let min_samples = self.config.min_new_samples_for_retrain.max(1);
+            let ewma = self.live_q_error_ewma();
+            return Ok(since_retrain >= min_samples
+                || (total_ingested as usize >= min_samples
+                    && ewma > self.config.drift_q_error_threshold));
+        }
 
-        // 3. Build 39-dim dense features and persist sample into SQLite stratified store
-        let (dense, _) = self.catalog.build_dense_features(&sample.plan_features);
-        self.store
-            .insert_sample(sample.plan_features.plan_hash, &dense, sample)?;
+        let mut batch_rows = Vec::with_capacity(samples.len());
+        for sample in samples {
+            // 1. Evaluate current prediction error for live drift detector before updating models
+            let pre_pred = self.predict(&sample.plan_features, true);
+            let log_pred = (1.0 + pre_pred.predicted_mem_bytes_p90 as f64).ln();
+            let log_actual = (1.0 + sample.effective_mem_bytes as f64).ln();
+            let log_q_err = (log_pred - log_actual).abs().clamp(0.0, 10.0);
+            self.update_q_error_ewma(log_q_err);
 
-        let total_ingested = self.ingested_samples.fetch_add(1, Ordering::Relaxed) + 1;
-        let since_retrain = self.samples_since_retrain.fetch_add(1, Ordering::Relaxed) + 1;
+            // 2. Update TableCatalog, Tier 1 Sketch, and Tier 3 RLS Calibrator
+            let spilled = sample.spilled_bytes > 0;
+            let cbo_mem_log = sample.plan_features.plan_features_24[21];
+            self.catalog.record_execution(
+                &sample.plan_features.tables,
+                sample.scan_bytes,
+                sample.scan_rows,
+                sample.effective_mem_bytes,
+                cbo_mem_log,
+                spilled,
+            );
+            self.sketch.update(
+                &sample.plan_features,
+                sample.effective_mem_bytes,
+                sample.scan_bytes,
+                sample.return_rows,
+                sample.cpu_cost_ns,
+                spilled,
+            );
+            self.rls.update(
+                &sample.plan_features,
+                sample.effective_mem_bytes,
+                sample.scan_bytes,
+                sample.return_rows,
+                sample.cpu_cost_ns,
+            );
+
+            // 3. Build 39-dim dense features for batch persistence
+            let (dense, _) = self.catalog.build_dense_features(&sample.plan_features);
+            batch_rows.push((sample.plan_features.plan_hash, dense, sample));
+        }
+
+        self.store.insert_samples_batch(&batch_rows)?;
+
+        let batch_len = samples.len();
+        let total_ingested = self
+            .ingested_samples
+            .fetch_add(batch_len as u64, Ordering::Relaxed)
+            + batch_len as u64;
+        let since_retrain = self
+            .samples_since_retrain
+            .fetch_add(batch_len, Ordering::Relaxed)
+            + batch_len;
         let min_samples = self.config.min_new_samples_for_retrain.max(1);
         let ewma = self.live_q_error_ewma();
 
@@ -644,5 +672,53 @@ mod tests {
         assert!(promoted.promoted);
         assert_eq!(promoted.training_samples, 30);
         assert_eq!(promoted.model_version, 1);
+    }
+
+    #[test]
+    fn test_observe_executions_batch_updates_all_tiers_and_triggers_retrain() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let cfg = AppConfig {
+            db_path: tmp.path().to_path_buf(),
+            min_new_samples_for_retrain: 30,
+            ..Default::default()
+        };
+        let store = Arc::new(SqliteStore::open(&cfg.db_path, 1000).unwrap());
+        let engine = EnsembleEngine::new(cfg, store).unwrap();
+
+        let mut samples = Vec::with_capacity(35);
+        for i in 0..35 {
+            let rows_log = 11 + (i % 5);
+            let pipe = format!(
+                "tables=[0,0,404]|env=[3,16,24]|var=[8]|operators=[39,1,{},100,16,14,0,12,2,1,1]",
+                rows_log
+            );
+            let pf = parse_feature_string(&pipe).unwrap();
+            samples.push(TelemetrySample {
+                digest: format!("b{}", i),
+                plan_features: pf,
+                effective_mem_bytes: 60_000_000 + (rows_log as u64) * 8_000_000,
+                scan_bytes: 18_000_000,
+                scan_rows: 60_000,
+                return_rows: 600,
+                cpu_cost_ns: 120_000_000,
+                spilled_bytes: 0,
+                query_time_ms: 35,
+                state: "EOF".to_string(),
+                timestamp_s: 1700003000 + i as u64,
+            });
+        }
+
+        let should_retrain = engine.observe_executions_batch(&samples).unwrap();
+        assert!(should_retrain);
+
+        let status = engine.status();
+        assert_eq!(status.ingested_samples, 35);
+        assert_eq!(status.sketch_entries, 1);
+        assert_eq!(status.known_tables, 1);
+
+        let report = engine.retrain_and_promote().unwrap();
+        assert!(report.promoted);
+        assert_eq!(report.model_version, 1);
+        assert_eq!(engine.status().model_version, 1);
     }
 }

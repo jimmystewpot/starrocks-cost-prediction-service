@@ -101,21 +101,24 @@ impl SqliteStore {
         dense: &DenseFeatureVector,
         sample: &TelemetrySample,
     ) -> Result<(), StorageError> {
-        let stratum_idx = (memory_stratum(sample.effective_mem_bytes) as usize).min(4);
-        let stratum = stratum_idx as i64;
-        let mut features_blob = [0u8; DENSE_FEATURE_DIM * 8];
-        for (i, &val) in dense.iter().enumerate() {
-            features_blob[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
-        }
+        self.insert_samples_batch(&[(plan_hash, *dense, sample)])
+    }
 
-        let log_mem = (1.0 + sample.effective_mem_bytes as f64).ln();
-        let log_scan_bytes = (1.0 + sample.scan_bytes as f64).ln();
-        let log_return_rows = (1.0 + sample.return_rows as f64).ln();
-        let log_cpu_ns = (1.0 + sample.cpu_cost_ns as f64).ln();
-        let spilled = if sample.spilled_bytes > 0 { 1.0 } else { 0.0 };
+    pub fn insert_samples_batch(
+        &self,
+        batch: &[(u64, DenseFeatureVector, &TelemetrySample)],
+    ) -> Result<(), StorageError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
 
         let conn = self.lock_conn();
         let tx = conn.unchecked_transaction()?;
+
+        let mut pending_counts: [usize; 5] =
+            std::array::from_fn(|i| self.stratum_counts[i].load(Ordering::Relaxed));
+        let mut touched_strata = [false; 5];
+
         {
             let mut insert_stmt = tx.prepare_cached(
                 "INSERT INTO telemetry_samples (
@@ -123,34 +126,57 @@ impl SqliteStore {
                     log_mem, log_scan_bytes, log_return_rows, log_cpu_ns, spilled, created_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
-            insert_stmt.execute(params![
-                plan_hash as i64,
-                stratum,
-                &features_blob[..],
-                log_mem,
-                log_scan_bytes,
-                log_return_rows,
-                log_cpu_ns,
-                spilled,
-                sample.timestamp_s as i64,
-            ])?;
+
+            let mut features_blob = [0u8; DENSE_FEATURE_DIM * 8];
+            for &(plan_hash, ref dense, sample) in batch {
+                let stratum_idx = (memory_stratum(sample.effective_mem_bytes) as usize).min(4);
+                let stratum = stratum_idx as i64;
+                for (i, &val) in dense.iter().enumerate() {
+                    features_blob[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
+                }
+
+                let log_mem = (1.0 + sample.effective_mem_bytes as f64).ln();
+                let log_scan_bytes = (1.0 + sample.scan_bytes as f64).ln();
+                let log_return_rows = (1.0 + sample.return_rows as f64).ln();
+                let log_cpu_ns = (1.0 + sample.cpu_cost_ns as f64).ln();
+                let spilled = if sample.spilled_bytes > 0 { 1.0 } else { 0.0 };
+
+                insert_stmt.execute(params![
+                    plan_hash as i64,
+                    stratum,
+                    &features_blob[..],
+                    log_mem,
+                    log_scan_bytes,
+                    log_return_rows,
+                    log_cpu_ns,
+                    spilled,
+                    sample.timestamp_s as i64,
+                ])?;
+
+                pending_counts[stratum_idx] += 1;
+                touched_strata[stratum_idx] = true;
+            }
         }
 
-        let prev_count = self.stratum_counts[stratum_idx].load(Ordering::Relaxed);
-        let mut new_count = prev_count + 1;
-        if new_count > self.max_per_stratum {
-            let excess = (new_count - self.max_per_stratum) as i64;
-            let mut del_stmt = tx.prepare_cached(
-                "DELETE FROM telemetry_samples WHERE id IN (
-                    SELECT id FROM telemetry_samples WHERE mem_stratum = ?1 ORDER BY id ASC LIMIT ?2
-                 )",
-            )?;
-            let deleted = del_stmt.execute(params![stratum, excess])?;
-            new_count = new_count.saturating_sub(deleted);
+        for stratum_idx in 0..5 {
+            if touched_strata[stratum_idx] && pending_counts[stratum_idx] > self.max_per_stratum {
+                let excess = (pending_counts[stratum_idx] - self.max_per_stratum) as i64;
+                let mut del_stmt = tx.prepare_cached(
+                    "DELETE FROM telemetry_samples WHERE id IN (
+                        SELECT id FROM telemetry_samples WHERE mem_stratum = ?1 ORDER BY id ASC LIMIT ?2
+                     )",
+                )?;
+                let deleted = del_stmt.execute(params![stratum_idx as i64, excess])?;
+                pending_counts[stratum_idx] = pending_counts[stratum_idx].saturating_sub(deleted);
+            }
         }
 
         tx.commit()?;
-        self.stratum_counts[stratum_idx].store(new_count, Ordering::Relaxed);
+        for (stratum_idx, &count) in pending_counts.iter().enumerate() {
+            if touched_strata[stratum_idx] {
+                self.stratum_counts[stratum_idx].store(count, Ordering::Relaxed);
+            }
+        }
 
         Ok(())
     }
@@ -415,5 +441,40 @@ mod tests {
         let reopened = SqliteStore::open(tmp.path(), 10).unwrap();
         assert_eq!(reopened.sample_counts_by_stratum().unwrap(), counts_before);
         assert_eq!(reopened.snapshot_count().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_insert_samples_batch_commits_and_compacts_in_single_transaction() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::open(tmp.path(), 5).unwrap();
+        let line_stratum3 = "digest=d1|cpuCostNs=100|memCostBytes=2000000000|scanBytes=1000|scanRows=10|returnRows=1|spilledBytes=0|time=10|state=EOF|catalog=c|database=d|tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]";
+        let sample_stratum3 = parse_features_log_line(line_stratum3).unwrap().unwrap();
+        let mut sample_stratum0 = sample_stratum3.clone();
+        sample_stratum0.effective_mem_bytes = 2_000_000;
+
+        let mut samples = Vec::with_capacity(25);
+        for _ in 0..3 {
+            samples.push(sample_stratum3.clone());
+        }
+        for _ in 0..22 {
+            samples.push(sample_stratum0.clone());
+        }
+
+        let dense = [0.0_f64; 39];
+        let batch: Vec<(u64, DenseFeatureVector, &TelemetrySample)> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (1000 + i as u64, dense, s))
+            .collect();
+
+        store.insert_samples_batch(&batch).unwrap();
+
+        let counts = store.sample_counts_by_stratum().unwrap();
+        assert_eq!(counts[0], 5, "stratum 0 compacted to 5 in batch");
+        assert_eq!(counts[3], 3, "stratum 3 retained all 3 in batch");
+        assert_eq!(counts, [5, 0, 0, 3, 0]);
+
+        let rows = store.load_training_rows().unwrap();
+        assert_eq!(rows.len(), 8);
     }
 }
