@@ -477,4 +477,40 @@ mod tests {
         let rows = store.load_training_rows().unwrap();
         assert_eq!(rows.len(), 8);
     }
+
+    #[test]
+    fn test_sqlite_batch_empty_and_corrupt_blob_error() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStore::open(tmp.path(), 5).unwrap();
+
+        // 1. insert_samples_batch with empty slice
+        store.insert_samples_batch(&[]).unwrap();
+        assert_eq!(store.load_training_rows().unwrap().len(), 0);
+
+        // 2. Corrupt features_blob error handling in load_training_rows
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "INSERT INTO telemetry_samples (
+                    plan_hash, mem_stratum, features_blob,
+                    log_mem, log_scan_bytes, log_return_rows, log_cpu_ns, spilled, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    1_i64,
+                    0_i64,
+                    b"bad_msgpack" as &[u8],
+                    10.0_f64,
+                    10.0_f64,
+                    10.0_f64,
+                    10.0_f64,
+                    0.0_f64,
+                    1000_i64,
+                ],
+            )
+            .unwrap();
+        }
+
+        let res = store.load_training_rows();
+        assert!(matches!(res, Err(StorageError::Serialization(_))));
+    }
 }

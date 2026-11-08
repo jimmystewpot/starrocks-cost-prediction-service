@@ -293,4 +293,36 @@ Query:
         assert_eq!(ev.state, "EOF");
         assert_eq!(ev.tables, vec!["1001"]);
     }
+
+    #[test]
+    fn test_parser_edge_cases_and_byte_units() {
+        // 1. parse_features_log_line("   ") -> Ok(None)
+        assert_eq!(parse_features_log_line("   ").unwrap(), None);
+
+        // 2. parse_features_log_line("state=EOF|tables=[0,0,1]|env=[1,8,24]|var=[1]|operators=[38,0,0,0,0,0,0]") -> Err
+        assert!(
+            parse_features_log_line(
+                "state=EOF|tables=[0,0,1]|env=[1,8,24]|var=[1]|operators=[38,0,0,0,0,0,0]"
+            )
+            .is_err()
+        );
+
+        // 3. parse_query_profile("   ") -> Err (empty profile)
+        assert!(parse_query_profile("   ").is_err());
+
+        // 4. parse_query_profile with GB, KB, and B byte units
+        let profile_text = "\
+Query:
+  - PeakMemoryUsage: 1.5 GB
+  - SpilledBytes: 512 KB
+  - BytesRead: 4096 B
+";
+        let summary = parse_query_profile(profile_text).unwrap();
+        assert_eq!(
+            summary.peak_mem_bytes,
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
+        assert_eq!(summary.spilled_bytes, 512 * 1024);
+        assert_eq!(summary.scan_bytes, 4096);
+    }
 }

@@ -275,4 +275,31 @@ mod tests {
         assert_eq!(restored.len(), 2);
         assert!(restored.predict(&p2).is_some());
     }
+
+    #[test]
+    fn test_plan_sketch_edge_cases() {
+        let mut sketch = PlanSketchCache::new(10);
+        assert!(sketch.is_empty());
+        assert_eq!(sketch.len(), 0);
+
+        let mut plan = make_test_plan(1, 12.0, 15.0);
+        plan.plan_features_24[4] = 0.0;
+        plan.plan_features_24[3] = 12.0;
+
+        sketch.update(&plan, 10_000_000, 1_000_000, 100, 1_000_000, false);
+        assert!(!sketch.is_empty());
+        assert_eq!(sketch.len(), 1);
+
+        let pred = sketch.predict(&plan).expect("prediction should exist");
+        assert!(pred.confidence > 0.0);
+
+        // Test evict_if_needed(Some(1)) fallback .or_else(...) branch:
+        // Set sketch.max_entries = 0 so map.len() (1) > max_entries (0).
+        // Passing exclude_key = Some(1) causes the initial filter to yield nothing,
+        // triggering the .or_else fallback to evict key 1.
+        sketch.max_entries = 0;
+        sketch.evict_if_needed(Some(1));
+        assert!(sketch.is_empty());
+        assert_eq!(sketch.len(), 0);
+    }
 }

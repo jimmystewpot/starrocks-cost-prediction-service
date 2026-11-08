@@ -721,4 +721,82 @@ mod tests {
         assert_eq!(report.model_version, 1);
         assert_eq!(engine.status().model_version, 1);
     }
+
+    #[test]
+    fn test_ensemble_retrain_promotion_and_batch_edge_cases() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let cfg = AppConfig {
+            db_path: tmp.path().to_path_buf(),
+            min_new_samples_for_retrain: 30,
+            ..Default::default()
+        };
+        let store = Arc::new(SqliteStore::open(&cfg.db_path, 1000).unwrap());
+        let engine = EnsembleEngine::new(cfg, store.clone()).unwrap();
+
+        // 1. observe_executions_batch(&[]) fast path
+        let empty_retrain = engine.observe_executions_batch(&[]).unwrap();
+        assert!(!empty_retrain);
+
+        // 2. persist_snapshot() when active_gbdt is None (covers metrics_json == "{}" branch)
+        engine.persist_snapshot().unwrap();
+        let snap = store
+            .load_latest_snapshot_blob()
+            .unwrap()
+            .expect("snapshot should exist");
+        assert_eq!(snap.1, "{}");
+
+        // 3. retrain_and_promote() with fewer than 20 samples -> promoted == false early return
+        let report_underflow = engine.retrain_and_promote().unwrap();
+        assert!(!report_underflow.promoted);
+        assert_eq!(report_underflow.training_samples, 0);
+
+        // Ingest 30 samples so that retrain_and_promote() can train a champion
+        for i in 0..30 {
+            let rows_log = 10 + (i % 5);
+            let pipe = format!(
+                "tables=[0,0,505]|env=[3,16,24]|var=[8]|operators=[39,1,{},100,16,14,0,12,2,1,1]",
+                rows_log
+            );
+            let pf = parse_feature_string(&pipe).unwrap();
+            let sample = TelemetrySample {
+                digest: format!("e{}", i),
+                plan_features: pf,
+                effective_mem_bytes: 50_000_000 + (rows_log as u64) * 5_000_000,
+                scan_bytes: 10_000_000,
+                scan_rows: 50_000,
+                return_rows: 500,
+                cpu_cost_ns: 100_000_000,
+                spilled_bytes: 0,
+                query_time_ms: 20,
+                state: "EOF".to_string(),
+                timestamp_s: 1700004000 + i as u64,
+            };
+            engine.observe_execution(&sample).unwrap();
+        }
+
+        // Promote first champion
+        let report_first = engine.retrain_and_promote().unwrap();
+        assert!(report_first.promoted);
+        assert_eq!(report_first.model_version, 1);
+
+        // 4. Overwrite champion's holdout_metrics to have near-zero pinball_p90,
+        // so challenger will not beat it (covers promoted == false post-evaluation branch).
+        let current_active = (**engine.active_gbdt.load())
+            .clone()
+            .expect("champion active");
+        let impossible_champ = ActiveGbdtSnapshot {
+            holdout_metrics: HoldoutMetrics {
+                pinball_p90: 1e-12,
+                q_error_p50: 1.0,
+                q_error_p90: 1.0,
+                validation_samples: 10,
+            },
+            ..current_active
+        };
+        engine.active_gbdt.store(Arc::new(Some(impossible_champ)));
+
+        let report_rejected = engine.retrain_and_promote().unwrap();
+        assert!(!report_rejected.promoted);
+        assert_eq!(report_rejected.model_version, 1);
+    }
 }
