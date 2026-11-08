@@ -572,6 +572,123 @@ mod tests {
     }
 
     #[test]
+    fn test_decoder_error_branches_and_segment_disambiguation() {
+        // parse_predict_csv("") -> Err(DecodeError::EmptyInput)
+        assert!(matches!(
+            parse_predict_csv(""),
+            Err(DecodeError::EmptyInput)
+        ));
+
+        // parse_predict_csv("tables_0,operators_0\n") -> Err(DecodeError::InvalidCsvFormat(_))
+        assert!(matches!(
+            parse_predict_csv("tables_0,operators_0\n"),
+            Err(DecodeError::InvalidCsvFormat(_))
+        ));
+
+        // parse_predict_csv("0,1001,1002,3,16,24,8,34,1,10,100,14,12,0,2") -> Ok (headerless data row)
+        let headerless = parse_predict_csv("0,1001,1002,3,16,24,8,34,1,10,100,14,12,0,2")
+            .expect("headerless CSV must parse cleanly");
+        assert_eq!(headerless.tables, ["0", "1001", "1002"]);
+        assert_eq!(headerless.num_be_nodes, 3);
+        assert_eq!(headerless.avg_cpu_cores, 16);
+        assert_eq!(headerless.env_mem_log, 24);
+        assert_eq!(headerless.pipeline_dop, 8);
+        assert_eq!(headerless.segments.len(), 1);
+        assert_eq!(headerless.segments[0].kind, OperatorSegmentKind::Exchange);
+
+        // parse_predict_csv("0,1,2") -> Err(DecodeError::InvalidCsvFormat(_)) (< 7 columns)
+        assert!(matches!(
+            parse_predict_csv("0,1,2"),
+            Err(DecodeError::InvalidCsvFormat(_))
+        ));
+
+        // parse_feature_string("") -> Err(DecodeError::EmptyInput)
+        assert!(matches!(
+            parse_feature_string(""),
+            Err(DecodeError::EmptyInput)
+        ));
+
+        // parse_feature_string("tables=[]|env=[3,16,24]|var=[8]|operators=[38,0,0,0,0,0,0]") -> Ok
+        // with tables == ["0", "0", "0"] and zero-operator feature branch
+        let zero_op =
+            parse_feature_string("tables=[]|env=[3,16,24]|var=[8]|operators=[38,0,0,0,0,0,0]")
+                .expect("zero-operator feature string should parse");
+        assert_eq!(zero_op.tables, ["0", "0", "0"]);
+        assert_eq!(zero_op.plan_features_24[0], 0.0); // total_physical_ops == 0
+        assert_eq!(zero_op.plan_features_24[2], 0.0); // scan_count == 0
+        assert_eq!(zero_op.plan_features_24[9], 0.0); // join_count == 0
+        assert_eq!(zero_op.plan_features_24[14], 0.0); // agg_count == 0
+
+        // parse_feature_string error branches
+        assert!(matches!(
+            parse_feature_string("tables=[1]|env=[1,2]|var=[8]|operators=[38,0,0,0,0,0,0]"),
+            Err(DecodeError::InvalidFeatureString(_))
+        ));
+        assert!(matches!(
+            parse_feature_string("tables=[1]|env=[3,16,24]|var=[]|operators=[38,0,0,0,0,0,0]"),
+            Err(DecodeError::InvalidFeatureString(_))
+        ));
+        assert!(matches!(
+            parse_feature_string("env=[3,16,24]|var=[8]|operators=[38,0,0,0,0,0,0]"),
+            Err(DecodeError::InvalidFeatureString(_))
+        ));
+        assert!(matches!(
+            parse_feature_string("tables=[1]|var=[8]|operators=[38,0,0,0,0,0,0]"),
+            Err(DecodeError::InvalidFeatureString(_))
+        ));
+        assert!(matches!(
+            parse_feature_string("tables=[1]|env=[3,16,24]|operators=[38,0,0,0,0,0,0]"),
+            Err(DecodeError::InvalidFeatureString(_))
+        ));
+        assert!(matches!(
+            parse_feature_string("tables=[1]|env=[3,16,24]|var=[8]"),
+            Err(DecodeError::InvalidFeatureString(_))
+        ));
+
+        // decode_operator_segments(&[]) -> Ok(vec![])
+        let empty_segs = decode_operator_segments(&[]).expect("empty ops slice should return Ok");
+        assert!(empty_segs.is_empty());
+
+        // decode_operator_segments(&[1, 2, 3]) -> Err (< 7 elements)
+        assert!(matches!(
+            decode_operator_segments(&[1, 2, 3]),
+            Err(DecodeError::InvalidOperatorSegments(_))
+        ));
+
+        // decode_operator_segments error cases
+        assert!(matches!(
+            decode_operator_segments(&[-1, 1, 0, 0, 0, 0, 0]),
+            Err(DecodeError::InvalidOperatorSegments(_))
+        ));
+        assert!(matches!(
+            decode_operator_segments(&[38, 1, -1, 0, 0, 0, 0]),
+            Err(DecodeError::InvalidOperatorSegments(_))
+        ));
+        assert!(matches!(
+            decode_operator_segments(&[38, 0, 1, 0, 0, 0, 0]),
+            Err(DecodeError::InvalidOperatorSegments(_))
+        ));
+        assert!(matches!(
+            decode_operator_segments(&[34, 1, 1, 1, 1, 1, 1, -5]),
+            Err(DecodeError::InvalidOperatorSegments(_))
+        ));
+        assert!(matches!(
+            decode_operator_segments(&[38, 1, 0, 0, 0, 0, 0, 99, 99]),
+            Err(DecodeError::InvalidOperatorSegments(_))
+        ));
+
+        // Two len == 11 segments without a HashJoin (ordinal = 35 and ordinal = 39)
+        let two_l11_ops = vec![
+            35, 1, 10, 50, 12, 10, 0, 10, 2, 1, 5, 39, 1, 15, 100, 18, 16, 0, 12, 3, 2, 2,
+        ];
+        let segments = decode_operator_segments(&two_l11_ops)
+            .expect("two len 11 segments without hash join must decode");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].kind, OperatorSegmentKind::HashAgg);
+        assert_eq!(segments[1].kind, OperatorSegmentKind::Scan);
+    }
+
+    #[test]
     fn test_table_catalog_target_encoding_and_known_ratio() {
         let catalog = TableCatalog::new();
         let pipe =

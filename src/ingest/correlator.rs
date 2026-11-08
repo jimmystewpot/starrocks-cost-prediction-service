@@ -161,6 +161,211 @@ mod tests {
     use crate::types::watermark_mem_bytes;
 
     #[test]
+    fn test_inflight_cache_ttl_expiry_and_edge_cases() {
+        let cache = InFlightCache::new(2, 1);
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+
+        // correlate_audit_event with predict_mem_bytes == 0 -> None
+        let audit_zero_predict = AuditLogEvent {
+            digest: "d0".to_string(),
+            predict_mem_bytes: 0,
+            mem_cost_bytes: 50_000_000,
+            scan_bytes: 1000,
+            scan_rows: 10,
+            return_rows: 1,
+            cpu_cost_ns: 100,
+            spilled_bytes: 0,
+            query_time_ms: 10,
+            state: "EOF".to_string(),
+            tables: vec!["db.t1".to_string()],
+        };
+        assert!(cache.correlate_audit_event(&audit_zero_predict).is_none());
+
+        // correlate_audit_event with state == "RUNNING" -> None
+        let audit_running = AuditLogEvent {
+            digest: "d_running".to_string(),
+            predict_mem_bytes: 67_108_864,
+            mem_cost_bytes: 50_000_000,
+            scan_bytes: 1000,
+            scan_rows: 10,
+            return_rows: 1,
+            cpu_cost_ns: 100,
+            spilled_bytes: 0,
+            query_time_ms: 10,
+            state: "RUNNING".to_string(),
+            tables: vec!["db.t1".to_string()],
+        };
+        assert!(cache.correlate_audit_event(&audit_running).is_none());
+
+        // Test tables_compatible via correlate_audit_event low10 fallback:
+        // 1. when audit.tables is empty (vec![])
+        let plan_with_tables = parse_feature_string(
+            "tables=[0,0,101]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]",
+        )
+        .unwrap();
+        let wm_with_tables = watermark_mem_bytes(50_000_000, plan_with_tables.plan_hash, 1_048_576);
+        cache.record_prediction(wm_with_tables, plan_with_tables.clone());
+
+        // Low-10 fallback occurs when high bits differ but low 10 bits match
+        let shifted_wm_empty_tables = (80_000_000 & !0x3FF) | (wm_with_tables & 0x3FF);
+        let audit_empty_tables = AuditLogEvent {
+            digest: "d_empty_tbl".to_string(),
+            predict_mem_bytes: shifted_wm_empty_tables,
+            mem_cost_bytes: 50_000_000,
+            scan_bytes: 1000,
+            scan_rows: 10,
+            return_rows: 1,
+            cpu_cost_ns: 100,
+            spilled_bytes: 0,
+            query_time_ms: 10,
+            state: "EOF".to_string(),
+            tables: vec![],
+        };
+        let sample_empty_tables = cache
+            .correlate_audit_event(&audit_empty_tables)
+            .expect("low10 fallback must succeed when audit.tables is empty");
+        assert_eq!(
+            sample_empty_tables.plan_features.plan_hash,
+            plan_with_tables.plan_hash
+        );
+
+        // Incompatible audit tables should return None
+        let audit_incompat = AuditLogEvent {
+            digest: "d_incompat".to_string(),
+            predict_mem_bytes: shifted_wm_empty_tables,
+            mem_cost_bytes: 50_000_000,
+            scan_bytes: 1000,
+            scan_rows: 10,
+            return_rows: 1,
+            cpu_cost_ns: 100,
+            spilled_bytes: 0,
+            query_time_ms: 10,
+            state: "EOF".to_string(),
+            tables: vec!["unrelated_table_999".to_string()],
+        };
+        assert!(cache.correlate_audit_event(&audit_incompat).is_none());
+
+        // 2. when plan.tables are all "0" (["0", "0", "0"])
+        let plan_all_zeros = parse_feature_string(
+            "tables=[0,0,0]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]",
+        )
+        .unwrap();
+        let wm_all_zeros = watermark_mem_bytes(60_000_000, plan_all_zeros.plan_hash, 1_048_576);
+        cache.record_prediction(wm_all_zeros, plan_all_zeros.clone());
+
+        let shifted_wm_zero_tables = (85_000_000 & !0x3FF) | (wm_all_zeros & 0x3FF);
+        let audit_zero_tables = AuditLogEvent {
+            digest: "d_zero_tbl".to_string(),
+            predict_mem_bytes: shifted_wm_zero_tables,
+            mem_cost_bytes: 60_000_000,
+            scan_bytes: 1000,
+            scan_rows: 10,
+            return_rows: 1,
+            cpu_cost_ns: 100,
+            spilled_bytes: 0,
+            query_time_ms: 10,
+            state: "EOF".to_string(),
+            tables: vec!["db.arbitrary_table".to_string()],
+        };
+        let sample_zero_tables = cache
+            .correlate_audit_event(&audit_zero_tables)
+            .expect("low10 fallback must succeed when plan.tables are all zeros");
+        assert_eq!(
+            sample_zero_tables.plan_features.plan_hash,
+            plan_all_zeros.plan_hash
+        );
+
+        // Record entries for direct lookup, fallback lookup, and capacity eviction
+        let plan_exp1 = parse_feature_string(
+            "tables=[0,0,501]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]",
+        )
+        .unwrap();
+        let plan_exp2 = parse_feature_string(
+            "tables=[0,0,502]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]",
+        )
+        .unwrap();
+        let plan_exp3 = parse_feature_string(
+            "tables=[0,0,503]|env=[3,16,24]|var=[8]|operators=[39,1,14,100,16,14,0,12,2,1,1]",
+        )
+        .unwrap();
+
+        // Use cache (capacity 2, ttl 1s) to test direct & fallback TTL expiry
+        let wm_exp1 = watermark_mem_bytes(70_000_000, plan_exp1.plan_hash, 1_048_576);
+        let wm_exp2 = watermark_mem_bytes(75_000_000, plan_exp2.plan_hash, 1_048_576);
+        cache.record_prediction(wm_exp1, plan_exp1.clone());
+        cache.record_prediction(wm_exp2, plan_exp2.clone());
+
+        // Prepare eviction cache (capacity 2, ttl 1s) with 2 entries before sleeping
+        let evict_cache = InFlightCache::new(2, 1);
+        let wm_evict1 = watermark_mem_bytes(90_000_000, plan_exp1.plan_hash, 1_048_576);
+        let wm_evict2 = watermark_mem_bytes(95_000_000, plan_exp2.plan_hash, 1_048_576);
+        let wm_evict3 = watermark_mem_bytes(100_000_000, plan_exp3.plan_hash, 1_048_576);
+        evict_cache.record_prediction(wm_evict1, plan_exp1.clone());
+        evict_cache.record_prediction(wm_evict2, plan_exp2.clone());
+        assert_eq!(evict_cache.len(), 2);
+
+        // Sleep to exceed 1-second TTL
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // Direct by_watermarked lookup detects expired entry, removes it, and returns None
+        let audit_exp1 = AuditLogEvent {
+            digest: "d_exp1".to_string(),
+            predict_mem_bytes: wm_exp1,
+            mem_cost_bytes: 70_000_000,
+            scan_bytes: 1000,
+            scan_rows: 10,
+            return_rows: 1,
+            cpu_cost_ns: 100,
+            spilled_bytes: 0,
+            query_time_ms: 10,
+            state: "EOF".to_string(),
+            tables: vec!["501".to_string()],
+        };
+        assert!(cache.correlate_audit_event(&audit_exp1).is_none());
+        assert!(!cache.by_watermarked.contains_key(&wm_exp1));
+
+        // Fallback by_low10 lookup detects expired entry, removes it, and returns None
+        let shifted_wm_exp2 = (88_000_000 & !0x3FF) | (wm_exp2 & 0x3FF);
+        let audit_exp2 = AuditLogEvent {
+            digest: "d_exp2".to_string(),
+            predict_mem_bytes: shifted_wm_exp2,
+            mem_cost_bytes: 75_000_000,
+            scan_bytes: 1000,
+            scan_rows: 10,
+            return_rows: 1,
+            cpu_cost_ns: 100,
+            spilled_bytes: 0,
+            query_time_ms: 10,
+            state: "EOF".to_string(),
+            tables: vec!["502".to_string()],
+        };
+        assert!(cache.correlate_audit_event(&audit_exp2).is_none());
+        assert!(!cache.by_watermarked.contains_key(&wm_exp2));
+
+        // Filling cache past capacity triggers evict_one_or_expired and purges expired_keys
+        evict_cache.record_prediction(wm_evict3, plan_exp3.clone());
+        assert_eq!(evict_cache.len(), 1);
+        assert!(!evict_cache.by_watermarked.contains_key(&wm_evict1));
+        assert!(!evict_cache.by_watermarked.contains_key(&wm_evict2));
+        assert!(evict_cache.by_watermarked.contains_key(&wm_evict3));
+
+        // Also verify eviction on `cache` directly: record 2 fresh entries, sleep, and record 3rd
+        let wm_c1 = watermark_mem_bytes(110_000_000, plan_exp1.plan_hash, 1_048_576);
+        let wm_c2 = watermark_mem_bytes(115_000_000, plan_exp2.plan_hash, 1_048_576);
+        let wm_c3 = watermark_mem_bytes(120_000_000, plan_exp3.plan_hash, 1_048_576);
+        cache.record_prediction(wm_c1, plan_exp1);
+        cache.record_prediction(wm_c2, plan_exp2);
+        assert_eq!(cache.len(), 2);
+        std::thread::sleep(Duration::from_millis(1100));
+        cache.record_prediction(wm_c3, plan_exp3);
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.by_watermarked.contains_key(&wm_c1));
+        assert!(!cache.by_watermarked.contains_key(&wm_c2));
+        assert!(cache.by_watermarked.contains_key(&wm_c3));
+    }
+
+    #[test]
     fn test_inflight_cache_correlates_audit_event_via_watermarked_mem_bytes() {
         let cache = InFlightCache::new(1000, 1800);
         let plan = parse_feature_string(
